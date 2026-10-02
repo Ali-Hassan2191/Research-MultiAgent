@@ -1,8 +1,11 @@
+# crew.py
+
 import os
 from typing import Any, Optional
 
 import streamlit as st
 from groq import Groq
+
 from crewai import Agent, Crew, Process, Task, BaseLLM
 
 from research_manager import create_research_manager
@@ -13,14 +16,21 @@ from synthesizer import create_synthesizer
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 MODEL_NAME = "openai/gpt-oss-120b"
 
 
+# ============================================================
+# SECRET HELPER
+# ============================================================
+
 def get_secret(name: str) -> str:
-    """Get a secret from environment variables or Streamlit secrets."""
+    """
+    Read a secret from environment variables first,
+    then fall back to Streamlit secrets.
+    """
 
     value = os.getenv(name)
 
@@ -28,9 +38,15 @@ def get_secret(name: str) -> str:
         return value
 
     try:
-        return st.secrets[name]
+        value = st.secrets[name]
+
+        if value:
+            return str(value)
+
     except Exception:
-        return ""
+        pass
+
+    return ""
 
 
 # ============================================================
@@ -39,10 +55,10 @@ def get_secret(name: str) -> str:
 
 class GroqCrewLLM(BaseLLM):
     """
-    CrewAI-compatible LLM that talks directly to Groq.
+    Custom CrewAI LLM implementation using the official
+    Groq Python SDK directly.
 
-    This avoids CrewAI's custom_openai model-name rewriting,
-    which would turn:
+    This avoids CrewAI's OpenAI-compatible provider changing:
 
         openai/gpt-oss-120b
 
@@ -50,7 +66,7 @@ class GroqCrewLLM(BaseLLM):
 
         gpt-oss-120b
 
-    Groq requires the full model ID.
+    which Groq does not accept.
     """
 
     def __init__(
@@ -68,12 +84,170 @@ class GroqCrewLLM(BaseLLM):
         if not api_key:
             raise ValueError(
                 "GROQ_API_KEY is not configured. "
-                "Add it to Streamlit Cloud Secrets."
+                "Add GROQ_API_KEY to Streamlit Cloud Secrets."
             )
 
         self.client = Groq(
-            api_key=api_key,
+            api_key=api_key
         )
+
+    # --------------------------------------------------------
+    # CLEAN CREWAI MESSAGE
+    # --------------------------------------------------------
+
+    def _clean_value(self, value):
+        """
+        Recursively clean objects before sending them to Groq.
+
+        In particular, CrewAI may add:
+
+            cache_breakpoint
+
+        to messages.
+
+        Groq Chat Completions does not accept that field, so
+        remove it before making the API request.
+        """
+
+        if isinstance(value, dict):
+
+            cleaned = {}
+
+            for key, item in value.items():
+
+                # CrewAI/OpenAI-compatible metadata that Groq
+                # Chat Completions does not accept.
+                if key == "cache_breakpoint":
+                    continue
+
+                cleaned[key] = self._clean_value(item)
+
+            return cleaned
+
+        if isinstance(value, list):
+
+            return [
+                self._clean_value(item)
+                for item in value
+            ]
+
+        if isinstance(value, tuple):
+
+            return [
+                self._clean_value(item)
+                for item in value
+            ]
+
+        return value
+
+    # --------------------------------------------------------
+    # CONVERT MESSAGE OBJECTS
+    # --------------------------------------------------------
+
+    def _clean_messages(self, messages):
+
+        if isinstance(messages, str):
+
+            return [
+                {
+                    "role": "user",
+                    "content": messages,
+                }
+            ]
+
+        clean_messages = []
+
+        for message in messages:
+
+            # Already a dictionary
+            if isinstance(message, dict):
+
+                cleaned_message = self._clean_value(
+                    message
+                )
+
+                clean_messages.append(
+                    cleaned_message
+                )
+
+                continue
+
+            # CrewAI/OpenAI-style message object
+            try:
+
+                cleaned_message = {
+                    "role": getattr(
+                        message,
+                        "role",
+                        "user",
+                    ),
+                    "content": self._clean_value(
+                        getattr(
+                            message,
+                            "content",
+                            "",
+                        )
+                    ),
+                }
+
+                # Preserve tool calls when present.
+                tool_calls = getattr(
+                    message,
+                    "tool_calls",
+                    None,
+                )
+
+                if tool_calls:
+
+                    cleaned_message[
+                        "tool_calls"
+                    ] = self._clean_value(
+                        tool_calls
+                    )
+
+                # Preserve tool-call related fields.
+                name = getattr(
+                    message,
+                    "name",
+                    None,
+                )
+
+                if name:
+
+                    cleaned_message[
+                        "name"
+                    ] = name
+
+                tool_call_id = getattr(
+                    message,
+                    "tool_call_id",
+                    None,
+                )
+
+                if tool_call_id:
+
+                    cleaned_message[
+                        "tool_call_id"
+                    ] = tool_call_id
+
+                clean_messages.append(
+                    cleaned_message
+                )
+
+            except Exception:
+
+                clean_messages.append(
+                    {
+                        "role": "user",
+                        "content": str(message),
+                    }
+                )
+
+        return clean_messages
+
+    # --------------------------------------------------------
+    # CREWAI LLM CALL
+    # --------------------------------------------------------
 
     def call(
         self,
@@ -84,42 +258,13 @@ class GroqCrewLLM(BaseLLM):
         **kwargs,
     ) -> Any:
 
-        # Convert a single string into a message list.
-        if isinstance(messages, str):
-            messages = [
-                {
-                    "role": "user",
-                    "content": messages,
-                }
-            ]
+        clean_messages = self._clean_messages(
+            messages
+        )
 
-        # Make a normal Python list.
-        clean_messages = []
-
-        for message in messages:
-
-            if isinstance(message, dict):
-
-                clean_messages.append(message)
-
-            else:
-
-                # Defensive conversion for CrewAI message objects.
-                try:
-                    clean_messages.append(
-                        {
-                            "role": message.role,
-                            "content": message.content,
-                        }
-                    )
-                except Exception:
-
-                    clean_messages.append(
-                        {
-                            "role": "user",
-                            "content": str(message),
-                        }
-                    )
+        # ----------------------------------------------------
+        # GROQ REQUEST
+        # ----------------------------------------------------
 
         request_kwargs = {
             "model": self.model,
@@ -127,49 +272,68 @@ class GroqCrewLLM(BaseLLM):
             "temperature": self.temperature,
         }
 
-        # CrewAI converts its tools into OpenAI-compatible schemas.
+        # ----------------------------------------------------
+        # TOOL CALLING
+        # ----------------------------------------------------
+
         if tools:
 
-            request_kwargs["tools"] = tools
+            request_kwargs["tools"] = (
+                self._clean_value(tools)
+            )
+
             request_kwargs["tool_choice"] = "auto"
 
-        # Send request directly to Groq.
-        response = self.client.chat.completions.create(
-            **request_kwargs
+        # ----------------------------------------------------
+        # CALL GROQ
+        # ----------------------------------------------------
+
+        response = (
+            self.client
+            .chat
+            .completions
+            .create(
+                **request_kwargs
+            )
         )
 
-        message = response.choices[0].message
+        message = (
+            response
+            .choices[0]
+            .message
+        )
 
         # ----------------------------------------------------
-        # TOOL CALL
+        # TOOL CALL RESPONSE
         # ----------------------------------------------------
 
-        if getattr(message, "tool_calls", None):
+        tool_calls = getattr(
+            message,
+            "tool_calls",
+            None,
+        )
 
-            return message.tool_calls
+        if tool_calls:
+
+            return tool_calls
 
         # ----------------------------------------------------
-        # NORMAL RESPONSE
+        # NORMAL TEXT RESPONSE
         # ----------------------------------------------------
 
         return message.content or ""
 
+    # --------------------------------------------------------
+    # CREWAI CAPABILITIES
+    # --------------------------------------------------------
+
     def supports_function_calling(self) -> bool:
-        """
-        GPT-OSS 120B supports tool/function calling on Groq.
-        """
         return True
 
     def supports_stop_words(self) -> bool:
-        """
-        We don't explicitly send CrewAI stop words to Groq.
-        """
         return False
 
     def get_context_window_size(self) -> int:
-        """
-        Groq lists GPT-OSS 120B with a 131,072-token context window.
-        """
         return 131072
 
 
@@ -186,19 +350,108 @@ def create_llm():
 
 
 # ============================================================
-# MAIN RESEARCH PIPELINE
+# SAFE OUTPUT HELPER
+# ============================================================
+
+def get_output_text(result) -> str:
+    """
+    Convert CrewAI CrewOutput / TaskOutput / normal values
+    into plain text.
+    """
+
+    if result is None:
+        return ""
+
+    # CrewOutput.raw
+    raw = getattr(
+        result,
+        "raw",
+        None,
+    )
+
+    if raw is not None:
+        return str(raw)
+
+    # TaskOutput.raw
+    output = getattr(
+        result,
+        "output",
+        None,
+    )
+
+    if output is not None:
+        return str(output)
+
+    return str(result)
+
+
+# ============================================================
+# STATUS CALLBACK HELPER
+# ============================================================
+
+def update_status(
+    status_callback,
+    key: str,
+    message: str,
+):
+    """
+    Safely update Streamlit UI status if a callback
+    was provided by app.py.
+    """
+
+    if status_callback is None:
+        return
+
+    try:
+        status_callback(
+            key,
+            message,
+        )
+    except Exception:
+        # UI callbacks should never crash research execution.
+        pass
+
+
+# ============================================================
+# MAIN RESEARCH FUNCTION
 # ============================================================
 
 def run_research(
     research_question: str,
     status_callback=None,
 ):
+    """
+    Run the complete multi-agent research pipeline.
 
-    if not research_question.strip():
+    Pipeline:
 
+        Research Manager
+              ↓
+        ┌─────┼─────────────┐
+        ↓     ↓             ↓
+       Web  Academic    Industry
+        └─────┼─────────────┘
+              ↓
+          Synthesizer
+              ↓
+          Final Report
+    """
+
+    if not research_question:
         raise ValueError(
-            "Research question cannot be empty."
+            "Please provide a research question."
         )
+
+    research_question = research_question.strip()
+
+    if not research_question:
+        raise ValueError(
+            "Please provide a research question."
+        )
+
+    # ========================================================
+    # CREATE LLM
+    # ========================================================
 
     llm = create_llm()
 
@@ -206,453 +459,593 @@ def run_research(
     # CREATE AGENTS
     # ========================================================
 
-    manager = create_research_manager(llm)
+    manager = create_research_manager(
+        llm=llm
+    )
 
-    web_researcher = create_web_researcher(llm)
+    web_researcher = create_web_researcher(
+        llm=llm
+    )
 
-    academic_researcher = create_academic_researcher(llm)
+    academic_researcher = create_academic_researcher(
+        llm=llm
+    )
 
-    industry_researcher = create_industry_researcher(llm)
+    industry_researcher = create_industry_researcher(
+        llm=llm
+    )
 
-    synthesizer = create_synthesizer(llm)
-
+    synthesizer = create_synthesizer(
+        llm=llm
+    )
 
     # ========================================================
-    # STAGE 1 — RESEARCH MANAGER
+    # 1. RESEARCH MANAGER
     # ========================================================
 
-    if status_callback:
-
-        status_callback(
-            "manager",
-            "running",
-            "🧭 Research Manager — planning research",
-        )
-
+    update_status(
+        status_callback,
+        "manager",
+        "Creating research strategy...",
+    )
 
     manager_task = Task(
         description=f"""
-        Develop a focused research plan for this question:
+You are managing a multi-agent research project.
 
-        {research_question}
+Research question:
 
-        The plan must identify:
+{research_question}
 
-        1. The main questions that need to be answered.
-        2. Important concepts and terminology.
-        3. What should be investigated on the public web.
-        4. What academic evidence should be investigated.
-        5. What industry and market evidence should be investigated.
-        6. Important limitations or uncertainties.
+Your job is to create a clear research plan for the
+specialist researchers.
 
-        Keep the plan practical and focused.
-        """,
+Create a plan containing:
 
+1. The main research objective.
+2. Key questions that must be answered.
+3. Important concepts or terminology to investigate.
+4. What evidence should be collected.
+5. What should be investigated by:
+   - Web Researcher
+   - Academic Researcher
+   - Industry / Market Researcher
+6. Important risks, assumptions, or limitations.
+
+Do NOT write the final research report.
+
+Your output should be a concise but detailed research plan
+that the three specialist researchers can directly follow.
+""",
         expected_output="""
-        A concise research plan containing:
-        - Research objectives
-        - Key questions
-        - Web research focus
-        - Academic research focus
-        - Industry research focus
-        - Important limitations
-        """,
+A structured research plan with:
 
+- research objective
+- key questions
+- evidence requirements
+- web research instructions
+- academic research instructions
+- industry research instructions
+- limitations and considerations
+""",
         agent=manager,
     )
 
-
     manager_crew = Crew(
-        agents=[manager],
-
-        tasks=[manager_task],
-
+        agents=[
+            manager
+        ],
+        tasks=[
+            manager_task
+        ],
         process=Process.sequential,
-
         verbose=False,
     )
 
-
     manager_result = manager_crew.kickoff()
 
-    research_plan = manager_result.raw
+    research_plan = get_output_text(
+        manager_result
+    )
 
-
-    if status_callback:
-
-        status_callback(
-            "manager",
-            "complete",
-            "✓ Research Manager — plan completed",
-        )
-
+    update_status(
+        status_callback,
+        "manager",
+        "Research strategy completed.",
+    )
 
     # ========================================================
-    # STAGE 2 — THREE PARALLEL RESEARCH AGENTS
+    # 2. SPECIALIST RESEARCH
     # ========================================================
 
-    if status_callback:
+    update_status(
+        status_callback,
+        "web",
+        "Web researcher started...",
+    )
 
-        status_callback(
-            "web",
-            "running",
-            "🌐 Web Research — working",
-        )
+    update_status(
+        status_callback,
+        "academic",
+        "Academic researcher started...",
+    )
 
-        status_callback(
-            "academic",
-            "running",
-            "🎓 Academic Research — working",
-        )
+    update_status(
+        status_callback,
+        "industry",
+        "Industry researcher started...",
+    )
 
-        status_callback(
-            "industry",
-            "running",
-            "📊 Industry Research — working",
-        )
-
-
-    # --------------------------------------------------------
-    # WEB
-    # --------------------------------------------------------
+    # ========================================================
+    # WEB RESEARCH TASK
+    # ========================================================
 
     web_task = Task(
         description=f"""
-        Research the following question from current public
-        web sources:
+Conduct web research for the following research project.
 
-        {research_question}
+RESEARCH QUESTION:
 
-        Research plan:
+{research_question}
 
-        {research_plan}
+RESEARCH PLAN:
 
-        Use your web research tools.
+{research_plan}
 
-        Find:
-        - Current facts
-        - Recent developments
-        - Important organizations
-        - Relevant statistics
-        - Industry announcements
-        - High-quality primary sources
+You are the Web Research Specialist.
 
-        Whenever possible, prefer primary or authoritative sources.
+Use your available web search and webpage-reading tools.
 
-        Include source URLs in your findings.
-        """,
+Focus on:
 
+- recent information
+- authoritative websites
+- official sources
+- reputable organizations
+- current statistics
+- documented facts
+- relevant reports
+- recent developments
+
+For every important finding, provide the source URL
+whenever possible.
+
+Do not simply produce a list of links.
+
+Explain:
+
+- what the source says
+- why it matters
+- how it relates to the research question
+
+Clearly distinguish facts from opinions or claims.
+
+Do not invent sources or statistics.
+
+Return structured research findings that another agent
+can use to write the final report.
+""",
         expected_output="""
-        A structured web research report containing:
-        - Key findings
-        - Evidence
-        - Important dates
-        - Relevant statistics
-        - Source URLs
-        - Uncertainties
-        """,
+Detailed web research findings including:
 
+- key findings
+- supporting evidence
+- source names
+- source URLs
+- relevant statistics
+- important recent developments
+- limitations or conflicting evidence
+""",
         agent=web_researcher,
-
         async_execution=True,
     )
 
-
-    # --------------------------------------------------------
-    # ACADEMIC
-    # --------------------------------------------------------
+    # ========================================================
+    # ACADEMIC RESEARCH TASK
+    # ========================================================
 
     academic_task = Task(
         description=f"""
-        Investigate the following research question using
-        academic and scholarly sources:
+Conduct academic research for the following project.
 
-        {research_question}
+RESEARCH QUESTION:
 
-        Research plan:
+{research_question}
 
-        {research_plan}
+RESEARCH PLAN:
 
-        Use the academic research tools.
+{research_plan}
 
-        Focus on:
-        - Peer-reviewed research
-        - Scholarly publications
-        - Research findings
-        - Methods
-        - Evidence
-        - Publication dates
-        - Citation information where available
+You are the Academic Research Specialist.
 
-        Clearly distinguish established findings from
-        preliminary or limited evidence.
+Use your academic search tools to find relevant
+peer-reviewed research, scholarly papers, studies,
+and academic literature.
 
-        Include source URLs or identifiers whenever available.
-        """,
+Focus on:
 
+- established research
+- recent studies
+- systematic reviews where available
+- important theoretical frameworks
+- empirical evidence
+- research findings
+- methodological limitations
+
+For important papers, provide:
+
+- paper title
+- authors when available
+- publication year
+- journal or venue when available
+- DOI or source URL when available
+- key finding
+- relevance to this research
+
+Do not invent papers, authors, statistics, or citations.
+
+Clearly identify where evidence is limited or mixed.
+
+Return structured academic findings that another agent
+can use in the final report.
+""",
         expected_output="""
-        A structured academic research report containing:
-        - Major academic findings
-        - Evidence
-        - Relevant studies
-        - Publication information
-        - Limitations
-        - Source URLs or identifiers
-        """,
+Detailed academic research findings including:
 
+- important studies
+- paper titles
+- authors
+- publication years
+- key findings
+- academic evidence
+- DOI/source URLs when available
+- limitations
+- areas of disagreement
+""",
         agent=academic_researcher,
-
         async_execution=True,
     )
 
-
-    # --------------------------------------------------------
-    # INDUSTRY
-    # --------------------------------------------------------
+    # ========================================================
+    # INDUSTRY RESEARCH TASK
+    # ========================================================
 
     industry_task = Task(
         description=f"""
-        Analyze the industry and market dimensions of:
+Conduct industry and market research for the following
+research project.
 
-        {research_question}
+RESEARCH QUESTION:
 
-        Research plan:
+{research_question}
 
-        {research_plan}
+RESEARCH PLAN:
 
-        Use web research tools to investigate:
+{research_plan}
 
-        - Companies
-        - Products
-        - Market developments
-        - Business models
-        - Commercial adoption
-        - Competitive landscape
-        - Investment or funding signals
-        - Industry challenges
-        - Market opportunities
+You are the Industry / Market Research Specialist.
 
-        Clearly distinguish reported facts from estimates
-        and company claims.
+Investigate the practical and commercial side of the topic.
 
-        Include source URLs.
-        """,
+Focus on:
 
+- industry trends
+- market developments
+- companies and organizations
+- products and services
+- adoption
+- business models
+- pricing where relevant
+- competitive landscape
+- market statistics
+- real-world implementations
+- current challenges
+- opportunities and risks
+
+Use web research and webpage-reading tools.
+
+Prefer primary sources, company reports, official
+documentation, reputable industry reports, and credible
+business sources.
+
+For important findings, provide source URLs.
+
+Do not invent market sizes, company claims, statistics,
+or business information.
+
+Clearly distinguish company claims from independently
+verified evidence.
+
+Return structured industry findings that another agent
+can use in the final report.
+""",
         expected_output="""
-        A structured industry research report containing:
-        - Market findings
-        - Company examples
-        - Competitive developments
-        - Business implications
-        - Industry challenges
-        - Source URLs
-        """,
+Detailed industry and market research including:
 
+- market trends
+- companies and organizations
+- products/services
+- adoption
+- competitive information
+- business models
+- statistics
+- practical applications
+- risks
+- source URLs
+""",
         agent=industry_researcher,
-
         async_execution=True,
     )
 
+    # ========================================================
+    # RUN THREE SPECIALISTS
+    #
+    # CrewAI async tasks execute concurrently within this
+    # specialist crew.
+    # ========================================================
 
-    research_crew = Crew(
+    specialist_crew = Crew(
         agents=[
             web_researcher,
             academic_researcher,
             industry_researcher,
         ],
-
         tasks=[
             web_task,
             academic_task,
             industry_task,
         ],
-
         process=Process.sequential,
-
         verbose=False,
     )
 
-
-    research_result = research_crew.kickoff()
-
+    specialist_result = specialist_crew.kickoff()
 
     # ========================================================
-    # EXTRACT RESEARCH RESULTS
+    # GET INDIVIDUAL RESULTS
     # ========================================================
 
-    research_outputs = []
-
-    for task_output in research_result.tasks_output:
-
-        try:
-            research_outputs.append(
-                task_output.raw
-            )
-        except Exception:
-
-            research_outputs.append(
-                str(task_output)
-            )
-
-
-    # We expect three outputs.
-    web_findings = (
-        research_outputs[0]
-        if len(research_outputs) > 0
-        else ""
+    web_findings = get_output_text(
+        getattr(
+            web_task,
+            "output",
+            None,
+        )
     )
 
-    academic_findings = (
-        research_outputs[1]
-        if len(research_outputs) > 1
-        else ""
+    academic_findings = get_output_text(
+        getattr(
+            academic_task,
+            "output",
+            None,
+        )
     )
 
-    industry_findings = (
-        research_outputs[2]
-        if len(research_outputs) > 2
-        else ""
+    industry_findings = get_output_text(
+        getattr(
+            industry_task,
+            "output",
+            None,
+        )
     )
 
-
-    if status_callback:
-
-        status_callback(
-            "web",
-            "complete",
-            "✓ Web Research — completed",
+    # Fallback if CrewAI did not attach task outputs
+    # individually for some reason.
+    if not web_findings:
+        web_findings = get_output_text(
+            specialist_result
         )
 
-        status_callback(
-            "academic",
-            "complete",
-            "✓ Academic Research — completed",
+    if not academic_findings:
+        academic_findings = (
+            "Academic research output was not "
+            "returned separately."
         )
 
-        status_callback(
-            "industry",
-            "complete",
-            "✓ Industry Research — completed",
+    if not industry_findings:
+        industry_findings = (
+            "Industry research output was not "
+            "returned separately."
         )
 
+    update_status(
+        status_callback,
+        "web",
+        "Web research completed.",
+    )
+
+    update_status(
+        status_callback,
+        "academic",
+        "Academic research completed.",
+    )
+
+    update_status(
+        status_callback,
+        "industry",
+        "Industry research completed.",
+    )
 
     # ========================================================
-    # STAGE 3 — SYNTHESIZER
+    # 3. SYNTHESIZER
     # ========================================================
 
-    if status_callback:
-
-        status_callback(
-            "synthesizer",
-            "running",
-            "✍️ Synthesizer — writing final report",
-        )
-
+    update_status(
+        status_callback,
+        "synthesizer",
+        "Synthesizing final report...",
+    )
 
     synthesis_task = Task(
         description=f"""
-        Create a high-quality final research report.
+You are the lead research synthesizer.
 
-        ORIGINAL QUESTION
-        ==================
-        {research_question}
+Write a high-quality final research report based ONLY
+on the research material provided below.
 
+========================================================
+RESEARCH QUESTION
+========================================================
 
-        RESEARCH PLAN
-        ==================
-        {research_plan}
+{research_question}
 
+========================================================
+RESEARCH PLAN
+========================================================
 
-        WEB RESEARCH
-        ==================
-        {web_findings}
+{research_plan}
 
+========================================================
+WEB RESEARCH
+========================================================
 
-        ACADEMIC RESEARCH
-        ==================
-        {academic_findings}
+{web_findings}
 
+========================================================
+ACADEMIC RESEARCH
+========================================================
 
-        INDUSTRY / MARKET RESEARCH
-        ==================
-        {industry_findings}
+{academic_findings}
 
+========================================================
+INDUSTRY / MARKET RESEARCH
+========================================================
 
-        Your job is to synthesize the evidence.
+{industry_findings}
 
-        Do not simply copy the research outputs.
+========================================================
+REPORT REQUIREMENTS
+========================================================
 
-        Compare findings across the three perspectives.
+Create a professional research report.
 
-        Clearly distinguish:
-        - Established evidence
-        - Reported claims
-        - Estimates
-        - Conflicting evidence
-        - Important uncertainty
+Use this structure:
 
-        Do not invent sources, statistics, quotations,
-        companies, studies, or citations.
+# Executive Summary
 
-        Preserve useful source URLs from the research.
+Give a concise overview of the most important findings.
 
-        Produce a polished report suitable for a researcher,
-        student, analyst, or business professional.
-        """,
+# Introduction
 
+Explain the research question and why the topic matters.
+
+# Key Findings
+
+Present the major findings from all research streams.
+
+# Web Evidence
+
+Summarize important web-based evidence and current
+developments.
+
+# Academic Evidence
+
+Summarize relevant academic research and what it shows.
+
+# Industry / Market Landscape
+
+Discuss practical, commercial, and market developments.
+
+# Cross-Source Analysis
+
+Compare the web, academic, and industry evidence.
+
+Identify:
+
+- agreements
+- disagreements
+- evidence gaps
+- important trends
+- limitations
+
+# Practical Implications
+
+Explain what the evidence means in practical terms.
+
+# Risks and Limitations
+
+Identify uncertainty, limitations, missing evidence,
+and potential biases.
+
+# Conclusion
+
+Provide a concise evidence-based conclusion.
+
+# Sources
+
+List the most important sources with URLs when available.
+
+========================================================
+IMPORTANT RULES
+========================================================
+
+1. Do not invent facts.
+
+2. Do not invent citations.
+
+3. Do not invent URLs.
+
+4. If sources disagree, explain the disagreement.
+
+5. Clearly distinguish evidence from interpretation.
+
+6. Prefer evidence over unsupported claims.
+
+7. Use information from all three research streams.
+
+8. Do not mention internal agent names or the multi-agent
+   implementation in the final report.
+
+9. Do not say that you browsed the internet unless that
+   is relevant to explaining the sources.
+
+10. Make the report readable and professional.
+
+Return ONLY the final research report.
+""",
         expected_output="""
-        A complete Markdown research report with these sections:
+A complete professional research report containing:
 
-        # Executive Summary
-
-        # Key Findings
-
-        # Web Research Findings
-
-        # Academic Evidence
-
-        # Industry / Market Evidence
-
-        # Cross-Source Analysis
-
-        # Limitations and Uncertainties
-
-        # Conclusion
-
-        # Sources
-        """,
-
+- Executive Summary
+- Introduction
+- Key Findings
+- Web Evidence
+- Academic Evidence
+- Industry / Market Landscape
+- Cross-Source Analysis
+- Practical Implications
+- Risks and Limitations
+- Conclusion
+- Sources
+""",
         agent=synthesizer,
     )
 
-
     synthesis_crew = Crew(
-        agents=[synthesizer],
-
-        tasks=[synthesis_task],
-
+        agents=[
+            synthesizer
+        ],
+        tasks=[
+            synthesis_task
+        ],
         process=Process.sequential,
-
         verbose=False,
     )
 
-
     synthesis_result = synthesis_crew.kickoff()
 
-    final_report = synthesis_result.raw
+    final_report = get_output_text(
+        synthesis_result
+    )
 
-
-    if status_callback:
-
-        status_callback(
-            "synthesizer",
-            "complete",
-            "✓ Synthesizer — report completed",
-        )
-
+    update_status(
+        status_callback,
+        "synthesizer",
+        "Final report completed.",
+    )
 
     # ========================================================
-    # RETURN
+    # RETURN COMPLETE RESULT
     # ========================================================
 
     return {
