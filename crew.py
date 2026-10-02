@@ -1,7 +1,7 @@
 # crew.py
 
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from typing import Any
 
 import streamlit as st
@@ -22,16 +22,18 @@ from synthesizer import create_synthesizer
 
 MODEL_NAME = "openai/gpt-oss-120b"
 
+# Keep prompts/output relatively small for the 8K TPM limit.
+TEMPERATURE = 0.2
+
+# Number of retries for temporary Groq rate limits.
+MAX_RETRIES = 4
+
 
 # ============================================================
 # SECRET HELPER
 # ============================================================
 
 def get_secret(name: str) -> str:
-    """
-    Read a secret from environment variables first,
-    then Streamlit secrets.
-    """
 
     value = os.getenv(name)
 
@@ -55,20 +57,13 @@ def get_secret(name: str) -> str:
 # ============================================================
 
 class GroqCrewLLM(BaseLLM):
-    """
-    Custom CrewAI LLM using the official Groq Python SDK.
-
-    This is used instead of CrewAI's OpenAI-compatible
-    provider because Groq requires the exact model ID:
-
-        openai/gpt-oss-120b
-    """
 
     def __init__(
         self,
         model: str = MODEL_NAME,
-        temperature: float = 0.2,
+        temperature: float = TEMPERATURE,
     ):
+
         super().__init__(
             model=model,
             temperature=temperature,
@@ -86,9 +81,9 @@ class GroqCrewLLM(BaseLLM):
             api_key=api_key
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CLEAN VALUES
-    # --------------------------------------------------------
+    # ========================================================
 
     def _clean_value(self, value):
 
@@ -98,7 +93,7 @@ class GroqCrewLLM(BaseLLM):
 
             for key, item in value.items():
 
-                # CrewAI can add this field.
+                # CrewAI may add this field.
                 # Groq Chat Completions does not accept it.
                 if key == "cache_breakpoint":
                     continue
@@ -123,9 +118,9 @@ class GroqCrewLLM(BaseLLM):
 
         return value
 
-    # --------------------------------------------------------
+    # ========================================================
     # CLEAN MESSAGES
-    # --------------------------------------------------------
+    # ========================================================
 
     def _clean_messages(self, messages):
 
@@ -224,9 +219,9 @@ class GroqCrewLLM(BaseLLM):
 
         return clean_messages
 
-    # --------------------------------------------------------
-    # LLM CALL
-    # --------------------------------------------------------
+    # ========================================================
+    # GROQ CALL WITH RETRY
+    # ========================================================
 
     def call(
         self,
@@ -247,7 +242,6 @@ class GroqCrewLLM(BaseLLM):
             "temperature": self.temperature,
         }
 
-        # Tool/function calling
         if tools:
 
             request_kwargs["tools"] = (
@@ -256,37 +250,74 @@ class GroqCrewLLM(BaseLLM):
 
             request_kwargs["tool_choice"] = "auto"
 
-        response = (
-            self.client
-            .chat
-            .completions
-            .create(
-                **request_kwargs
-            )
+        # ----------------------------------------------------
+        # RETRY RATE LIMIT ERRORS
+        # ----------------------------------------------------
+
+        for attempt in range(MAX_RETRIES):
+
+            try:
+
+                response = (
+                    self.client
+                    .chat
+                    .completions
+                    .create(
+                        **request_kwargs
+                    )
+                )
+
+                message = (
+                    response
+                    .choices[0]
+                    .message
+                )
+
+                tool_calls = getattr(
+                    message,
+                    "tool_calls",
+                    None,
+                )
+
+                if tool_calls:
+
+                    return tool_calls
+
+                return message.content or ""
+
+            except Exception as exc:
+
+                error_text = str(exc)
+
+                is_rate_limit = (
+                    "429" in error_text
+                    or "rate_limit_exceeded" in error_text
+                    or "Rate limit" in error_text
+                )
+
+                if not is_rate_limit:
+                    raise
+
+                if attempt >= MAX_RETRIES - 1:
+                    raise
+
+                # Increasing wait time:
+                # 5s → 10s → 20s → 40s
+                wait_time = 5 * (
+                    2 ** attempt
+                )
+
+                time.sleep(
+                    wait_time
+                )
+
+        raise RuntimeError(
+            "Groq request failed after retries."
         )
 
-        message = (
-            response
-            .choices[0]
-            .message
-        )
-
-        # Return native tool calls to CrewAI.
-        tool_calls = getattr(
-            message,
-            "tool_calls",
-            None,
-        )
-
-        if tool_calls:
-
-            return tool_calls
-
-        return message.content or ""
-
-    # --------------------------------------------------------
+    # ========================================================
     # CREWAI CAPABILITIES
-    # --------------------------------------------------------
+    # ========================================================
 
     def supports_function_calling(self) -> bool:
         return True
@@ -306,7 +337,7 @@ def create_llm():
 
     return GroqCrewLLM(
         model=MODEL_NAME,
-        temperature=0.2,
+        temperature=TEMPERATURE,
     )
 
 
@@ -361,12 +392,81 @@ def update_status(
         )
 
     except Exception:
-        # Never let UI updates break the research pipeline.
         pass
 
 
 # ============================================================
-# WEB RESEARCH WORKER
+# MANAGER
+# ============================================================
+
+def run_manager(
+    research_question: str,
+    status_callback=None,
+):
+
+    update_status(
+        status_callback,
+        "manager",
+        "Research Manager is creating the plan...",
+    )
+
+    llm = create_llm()
+
+    manager = create_research_manager(
+        llm=llm
+    )
+
+    task = Task(
+        description=f"""
+Create a short research plan for:
+
+{research_question}
+
+Identify:
+
+1. Main objective
+2. 3 to 5 key questions
+3. Web evidence needed
+4. Academic evidence needed
+5. Industry evidence needed
+6. Important limitations
+
+Keep the plan concise.
+
+Do not write the final report.
+""",
+        expected_output="""
+A concise research plan with the objective,
+key questions, evidence requirements,
+and limitations.
+""",
+        agent=manager,
+    )
+
+    crew = Crew(
+        agents=[manager],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False,
+    )
+
+    result = crew.kickoff()
+
+    plan = get_output_text(
+        result
+    )
+
+    update_status(
+        status_callback,
+        "manager",
+        "Research plan completed.",
+    )
+
+    return plan
+
+
+# ============================================================
+# WEB RESEARCH
 # ============================================================
 
 def run_web_research(
@@ -375,117 +475,75 @@ def run_web_research(
     status_callback=None,
 ):
 
-    try:
+    update_status(
+        status_callback,
+        "web",
+        "Web researcher is working...",
+    )
 
-        update_status(
-            status_callback,
-            "web",
-            "Web researcher is working...",
-        )
+    llm = create_llm()
 
-        llm = create_llm()
+    agent = create_web_researcher(
+        llm=llm
+    )
 
-        web_researcher = create_web_researcher(
-            llm=llm
-        )
-
-        web_task = Task(
-            description=f"""
-Conduct web research for the following research project.
-
-RESEARCH QUESTION:
+    task = Task(
+        description=f"""
+Research this question:
 
 {research_question}
 
-RESEARCH PLAN:
+Research plan:
 
 {research_plan}
 
-You are the Web Research Specialist.
+Use web search and webpage-reading tools.
 
-Use your available web search and webpage-reading tools.
+Find the most important current evidence.
 
-Focus on:
+Return:
 
-- recent information
-- authoritative websites
-- official sources
-- reputable organizations
-- current statistics
-- documented facts
-- relevant reports
-- recent developments
-
-For every important finding, provide the source URL
-whenever possible.
-
-Do not simply produce a list of links.
-
-Explain:
-
-- what the source says
-- why it matters
-- how it relates to the research question
-
-Clearly distinguish facts from opinions or claims.
-
-Do not invent sources or statistics.
-
-Return structured research findings that another agent
-can use to write the final report.
-""",
-            expected_output="""
-Detailed web research findings including:
-
-- key findings
-- supporting evidence
+- 4 to 6 key findings
+- supporting facts
 - source names
 - source URLs
-- relevant statistics
-- important recent developments
-- limitations or conflicting evidence
+- important statistics if available
+
+Be concise.
+
+Do not invent facts or sources.
 """,
-            agent=web_researcher,
-        )
+        expected_output="""
+4 to 6 concise web research findings
+with supporting sources and URLs.
+""",
+        agent=agent,
+    )
 
-        web_crew = Crew(
-            agents=[
-                web_researcher
-            ],
-            tasks=[
-                web_task
-            ],
-            process=Process.sequential,
-            verbose=False,
-        )
+    crew = Crew(
+        agents=[agent],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False,
+    )
 
-        result = web_crew.kickoff()
+    result = crew.kickoff()
 
-        findings = get_output_text(
-            result
-        )
+    findings = get_output_text(
+        result
+    )
 
-        update_status(
-            status_callback,
-            "web",
-            "Web research completed.",
-        )
+    update_status(
+        status_callback,
+        "web",
+        "Web research completed.",
+    )
 
-        return findings
-
-    except Exception as exc:
-
-        update_status(
-            status_callback,
-            "web",
-            f"Web research failed: {exc}",
-        )
-
-        raise
+    return findings
 
 
 # ============================================================
-# ACADEMIC RESEARCH WORKER
+# ACADEMIC RESEARCH
 # ============================================================
 
 def run_academic_research(
@@ -494,119 +552,77 @@ def run_academic_research(
     status_callback=None,
 ):
 
-    try:
+    update_status(
+        status_callback,
+        "academic",
+        "Academic researcher is working...",
+    )
 
-        update_status(
-            status_callback,
-            "academic",
-            "Academic researcher is working...",
-        )
+    llm = create_llm()
 
-        llm = create_llm()
+    agent = create_academic_researcher(
+        llm=llm
+    )
 
-        academic_researcher = create_academic_researcher(
-            llm=llm
-        )
-
-        academic_task = Task(
-            description=f"""
-Conduct academic research for the following project.
-
-RESEARCH QUESTION:
+    task = Task(
+        description=f"""
+Research this question:
 
 {research_question}
 
-RESEARCH PLAN:
+Research plan:
 
 {research_plan}
 
-You are the Academic Research Specialist.
+Use academic search tools.
 
-Use your academic search tools to find relevant
-peer-reviewed research, scholarly papers, studies,
-and academic literature.
+Find the most relevant scholarly evidence.
 
-Focus on:
+Return:
 
-- established research
-- recent studies
-- systematic reviews where available
-- important theoretical frameworks
-- empirical evidence
-- research findings
-- methodological limitations
-
-For important papers, provide:
-
-- paper title
+- 3 to 5 important papers
+- title
 - authors when available
-- publication year
-- journal or venue when available
-- DOI or source URL when available
+- year
 - key finding
-- relevance to this research
-
-Do not invent papers, authors, statistics, or citations.
-
-Clearly identify where evidence is limited or mixed.
-
-Return structured academic findings that another agent
-can use in the final report.
-""",
-            expected_output="""
-Detailed academic research findings including:
-
-- important studies
-- paper titles
-- authors
-- publication years
-- key findings
-- academic evidence
-- DOI/source URLs when available
+- DOI or URL when available
 - limitations
-- areas of disagreement
+
+Be concise.
+
+Do not invent papers or citations.
 """,
-            agent=academic_researcher,
-        )
+        expected_output="""
+3 to 5 concise academic findings
+with paper information and source links.
+""",
+        agent=agent,
+    )
 
-        academic_crew = Crew(
-            agents=[
-                academic_researcher
-            ],
-            tasks=[
-                academic_task
-            ],
-            process=Process.sequential,
-            verbose=False,
-        )
+    crew = Crew(
+        agents=[agent],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False,
+    )
 
-        result = academic_crew.kickoff()
+    result = crew.kickoff()
 
-        findings = get_output_text(
-            result
-        )
+    findings = get_output_text(
+        result
+    )
 
-        update_status(
-            status_callback,
-            "academic",
-            "Academic research completed.",
-        )
+    update_status(
+        status_callback,
+        "academic",
+        "Academic research completed.",
+    )
 
-        return findings
-
-    except Exception as exc:
-
-        update_status(
-            status_callback,
-            "academic",
-            f"Academic research failed: {exc}",
-        )
-
-        raise
+    return findings
 
 
 # ============================================================
-# INDUSTRY RESEARCH WORKER
+# INDUSTRY RESEARCH
 # ============================================================
 
 def run_industry_research(
@@ -615,124 +631,83 @@ def run_industry_research(
     status_callback=None,
 ):
 
-    try:
+    update_status(
+        status_callback,
+        "industry",
+        "Industry researcher is working...",
+    )
 
-        update_status(
-            status_callback,
-            "industry",
-            "Industry researcher is working...",
-        )
+    llm = create_llm()
 
-        llm = create_llm()
+    agent = create_industry_researcher(
+        llm=llm
+    )
 
-        industry_researcher = create_industry_researcher(
-            llm=llm
-        )
-
-        industry_task = Task(
-            description=f"""
-Conduct industry and market research for the following
-research project.
-
-RESEARCH QUESTION:
+    task = Task(
+        description=f"""
+Research the industry and market side of:
 
 {research_question}
 
-RESEARCH PLAN:
+Research plan:
 
 {research_plan}
 
-You are the Industry / Market Research Specialist.
-
-Investigate the practical and commercial side of the topic.
+Use web research tools.
 
 Focus on:
 
 - industry trends
+- companies
+- products
+- adoption
 - market developments
-- companies and organizations
-- products and services
-- adoption
-- business models
-- pricing where relevant
-- competitive landscape
-- market statistics
-- real-world implementations
-- current challenges
-- opportunities and risks
-
-Use web research and webpage-reading tools.
-
-Prefer primary sources, company reports, official
-documentation, reputable industry reports, and credible
-business sources.
-
-For important findings, provide source URLs.
-
-Do not invent market sizes, company claims, statistics,
-or business information.
-
-Clearly distinguish company claims from independently
-verified evidence.
-
-Return structured industry findings that another agent
-can use in the final report.
-""",
-            expected_output="""
-Detailed industry and market research including:
-
-- market trends
-- companies and organizations
-- products/services
-- adoption
-- competitive information
-- business models
-- statistics
 - practical applications
+- business models
 - risks
+
+Return:
+
+- 4 to 6 key findings
+- evidence
+- source names
 - source URLs
+
+Be concise.
+
+Do not invent statistics or company claims.
 """,
-            agent=industry_researcher,
-        )
+        expected_output="""
+4 to 6 concise industry findings
+with evidence and source URLs.
+""",
+        agent=agent,
+    )
 
-        industry_crew = Crew(
-            agents=[
-                industry_researcher
-            ],
-            tasks=[
-                industry_task
-            ],
-            process=Process.sequential,
-            verbose=False,
-        )
+    crew = Crew(
+        agents=[agent],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False,
+    )
 
-        result = industry_crew.kickoff()
+    result = crew.kickoff()
 
-        findings = get_output_text(
-            result
-        )
+    findings = get_output_text(
+        result
+    )
 
-        update_status(
-            status_callback,
-            "industry",
-            "Industry research completed.",
-        )
+    update_status(
+        status_callback,
+        "industry",
+        "Industry research completed.",
+    )
 
-        return findings
-
-    except Exception as exc:
-
-        update_status(
-            status_callback,
-            "industry",
-            f"Industry research failed: {exc}",
-        )
-
-        raise
+    return findings
 
 
 # ============================================================
-# SYNTHESIS
+# SYNTHESIZER
 # ============================================================
 
 def run_synthesis(
@@ -744,197 +719,96 @@ def run_synthesis(
     status_callback=None,
 ):
 
-    try:
+    update_status(
+        status_callback,
+        "synthesizer",
+        "Synthesizer is writing the final report...",
+    )
 
-        update_status(
-            status_callback,
-            "synthesizer",
-            "Synthesizer is creating the final report...",
-        )
+    llm = create_llm()
 
-        llm = create_llm()
+    agent = create_synthesizer(
+        llm=llm
+    )
 
-        synthesizer = create_synthesizer(
-            llm=llm
-        )
-
-        synthesis_task = Task(
-            description=f"""
-You are the lead research synthesizer.
-
-Write a high-quality final research report based ONLY
-on the research material provided below.
-
-========================================================
-RESEARCH QUESTION
-========================================================
+    task = Task(
+        description=f"""
+Write a concise research report about:
 
 {research_question}
 
-========================================================
-RESEARCH PLAN
-========================================================
+RESEARCH PLAN:
 
 {research_plan}
 
-========================================================
-WEB RESEARCH
-========================================================
+WEB FINDINGS:
 
 {web_findings}
 
-========================================================
-ACADEMIC RESEARCH
-========================================================
+ACADEMIC FINDINGS:
 
 {academic_findings}
 
-========================================================
-INDUSTRY / MARKET RESEARCH
-========================================================
+INDUSTRY FINDINGS:
 
 {industry_findings}
 
-========================================================
-REPORT STRUCTURE
-========================================================
-
-Create a professional research report using:
+Use this structure:
 
 # Executive Summary
 
-Give a concise overview of the most important findings.
-
-# Introduction
-
-Explain the research question and why the topic matters.
-
 # Key Findings
-
-Present the major findings from all research streams.
-
-# Web Evidence
-
-Summarize important web-based evidence and current
-developments.
 
 # Academic Evidence
 
-Summarize relevant academic research and what it shows.
-
-# Industry / Market Landscape
-
-Discuss practical, commercial, and market developments.
+# Industry / Market Evidence
 
 # Cross-Source Analysis
 
-Compare the web, academic, and industry evidence.
-
-Identify:
-
-- agreements
-- disagreements
-- evidence gaps
-- important trends
-- limitations
-
-# Practical Implications
-
-Explain what the evidence means in practical terms.
-
-# Risks and Limitations
-
-Identify uncertainty, limitations, missing evidence,
-and potential biases.
+# Limitations
 
 # Conclusion
 
-Provide a concise evidence-based conclusion.
-
 # Sources
 
-List the most important sources with URLs when available.
+Rules:
 
-========================================================
-IMPORTANT RULES
-========================================================
-
-1. Do not invent facts.
-
-2. Do not invent citations.
-
-3. Do not invent URLs.
-
-4. If sources disagree, explain the disagreement.
-
-5. Clearly distinguish evidence from interpretation.
-
-6. Prefer evidence over unsupported claims.
-
-7. Use information from all three research streams.
-
-8. Do not mention internal agent names in the final report.
-
-9. Do not fabricate academic papers.
-
-10. Do not fabricate statistics.
-
-11. Make the report readable and professional.
-
-Return ONLY the final research report.
+- Use only the supplied research.
+- Do not invent facts.
+- Do not invent citations.
+- Preserve source URLs.
+- Clearly distinguish evidence from interpretation.
+- Mention disagreements when sources conflict.
+- Keep the report concise.
 """,
-            expected_output="""
-A complete professional research report containing:
-
-- Executive Summary
-- Introduction
-- Key Findings
-- Web Evidence
-- Academic Evidence
-- Industry / Market Landscape
-- Cross-Source Analysis
-- Practical Implications
-- Risks and Limitations
-- Conclusion
-- Sources
+        expected_output="""
+A concise evidence-based research report
+with findings, analysis, limitations,
+conclusion, and sources.
 """,
-            agent=synthesizer,
-        )
+        agent=agent,
+    )
 
-        synthesis_crew = Crew(
-            agents=[
-                synthesizer
-            ],
-            tasks=[
-                synthesis_task
-            ],
-            process=Process.sequential,
-            verbose=False,
-        )
+    crew = Crew(
+        agents=[agent],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False,
+    )
 
-        result = synthesis_crew.kickoff()
+    result = crew.kickoff()
 
-        final_report = get_output_text(
-            result
-        )
+    final_report = get_output_text(
+        result
+    )
 
-        update_status(
-            status_callback,
-            "synthesizer",
-            "Final report completed.",
-        )
+    update_status(
+        status_callback,
+        "synthesizer",
+        "Final report completed.",
+    )
 
-        return final_report
-
-    except Exception as exc:
-
-        update_status(
-            status_callback,
-            "synthesizer",
-            f"Synthesis failed: {exc}",
-        )
-
-        raise
+    return final_report
 
 
 # ============================================================
@@ -945,19 +819,6 @@ def run_research(
     research_question: str,
     status_callback=None,
 ):
-    """
-    Complete research pipeline.
-
-    1. Research Manager
-    2. Web Research       ┐
-    3. Academic Research  ├── run concurrently
-    4. Industry Research  ┘
-    5. Synthesizer
-    """
-
-    # ========================================================
-    # VALIDATE QUESTION
-    # ========================================================
 
     if not research_question:
 
@@ -976,155 +837,60 @@ def run_research(
         )
 
     # ========================================================
-    # MANAGER
+    # 1. MANAGER
     # ========================================================
 
-    update_status(
+    research_plan = run_manager(
+        research_question,
         status_callback,
-        "manager",
-        "Research Manager is creating the research plan...",
     )
 
-    llm = create_llm()
+    # ========================================================
+    # 2. WEB
+    #
+    # Sequential intentionally.
+    #
+    # Your current Groq account has an 8,000 TPM limit.
+    # Running three large requests concurrently causes
+    # 429 errors.
+    # ========================================================
 
-    manager = create_research_manager(
-        llm=llm
-    )
-
-    manager_task = Task(
-        description=f"""
-You are managing a multi-agent research project.
-
-RESEARCH QUESTION:
-
-{research_question}
-
-Create a clear research plan for the specialist
-researchers.
-
-The plan must contain:
-
-1. Main research objective.
-2. Key questions that must be answered.
-3. Important concepts and terminology.
-4. Evidence that should be collected.
-5. What should be investigated by:
-   - Web Researcher
-   - Academic Researcher
-   - Industry / Market Researcher
-6. Important risks, assumptions, and limitations.
-
-Do NOT write the final report.
-
-Create a concise but detailed research plan that the
-specialist researchers can directly follow.
-""",
-        expected_output="""
-A structured research plan containing:
-
-- research objective
-- key questions
-- evidence requirements
-- web research instructions
-- academic research instructions
-- industry research instructions
-- limitations and considerations
-""",
-        agent=manager,
-    )
-
-    manager_crew = Crew(
-        agents=[
-            manager
-        ],
-        tasks=[
-            manager_task
-        ],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-    manager_result = manager_crew.kickoff()
-
-    research_plan = get_output_text(
-        manager_result
-    )
-
-    update_status(
+    web_findings = run_web_research(
+        research_question,
+        research_plan,
         status_callback,
-        "manager",
-        "Research strategy completed.",
     )
 
-    # ========================================================
-    # RUN SPECIALISTS IN PARALLEL
-    # ========================================================
-
-    specialist_results = {}
-
-    with ThreadPoolExecutor(
-        max_workers=3
-    ) as executor:
-
-        futures = {
-
-            executor.submit(
-                run_web_research,
-                research_question,
-                research_plan,
-                status_callback,
-            ): "web",
-
-            executor.submit(
-                run_academic_research,
-                research_question,
-                research_plan,
-                status_callback,
-            ): "academic",
-
-            executor.submit(
-                run_industry_research,
-                research_question,
-                research_plan,
-                status_callback,
-            ): "industry",
-        }
-
-        for future in as_completed(
-            futures
-        ):
-
-            research_type = futures[
-                future
-            ]
-
-            # This will raise the original exception
-            # if a specialist failed.
-            specialist_results[
-                research_type
-            ] = future.result()
+    # Small pause so the next request doesn't immediately
+    # collide with the previous TPM window.
+    time.sleep(3)
 
     # ========================================================
-    # GET RESULTS
+    # 3. ACADEMIC
     # ========================================================
 
-    web_findings = specialist_results.get(
-        "web",
-        "",
+    academic_findings = run_academic_research(
+        research_question,
+        research_plan,
+        status_callback,
     )
 
-    academic_findings = specialist_results.get(
-        "academic",
-        "",
-    )
-
-    industry_findings = specialist_results.get(
-        "industry",
-        "",
-    )
+    time.sleep(3)
 
     # ========================================================
-    # SYNTHESIZER
+    # 4. INDUSTRY
+    # ========================================================
+
+    industry_findings = run_industry_research(
+        research_question,
+        research_plan,
+        status_callback,
+    )
+
+    time.sleep(3)
+
+    # ========================================================
+    # 5. SYNTHESIS
     # ========================================================
 
     final_report = run_synthesis(
@@ -1137,7 +903,7 @@ A structured research plan containing:
     )
 
     # ========================================================
-    # RETURN RESULT
+    # FINAL RESULT
     # ========================================================
 
     return {
