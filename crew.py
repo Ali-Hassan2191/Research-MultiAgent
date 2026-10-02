@@ -1,14 +1,9 @@
 import os
+from typing import Any, Optional
 
-from crewai import (
-    Agent,
-    Crew,
-    LLM,
-    Process,
-    Task,
-)
-
-from tools import get_secret
+import streamlit as st
+from groq import Groq
+from crewai import Agent, Crew, Process, Task, BaseLLM
 
 from research_manager import create_research_manager
 from web_researcher import create_web_researcher
@@ -18,29 +13,174 @@ from synthesizer import create_synthesizer
 
 
 # ============================================================
-# LLM
+# CONFIG
+# ============================================================
+
+MODEL_NAME = "openai/gpt-oss-120b"
+
+
+def get_secret(name: str) -> str:
+    """Get a secret from environment variables or Streamlit secrets."""
+
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    try:
+        return st.secrets[name]
+    except Exception:
+        return ""
+
+
+# ============================================================
+# CUSTOM GROQ LLM FOR CREWAI
+# ============================================================
+
+class GroqCrewLLM(BaseLLM):
+    """
+    CrewAI-compatible LLM that talks directly to Groq.
+
+    This avoids CrewAI's custom_openai model-name rewriting,
+    which would turn:
+
+        openai/gpt-oss-120b
+
+    into:
+
+        gpt-oss-120b
+
+    Groq requires the full model ID.
+    """
+
+    def __init__(
+        self,
+        model: str = MODEL_NAME,
+        temperature: float = 0.2,
+    ):
+        super().__init__(
+            model=model,
+            temperature=temperature,
+        )
+
+        api_key = get_secret("GROQ_API_KEY")
+
+        if not api_key:
+            raise ValueError(
+                "GROQ_API_KEY is not configured. "
+                "Add it to Streamlit Cloud Secrets."
+            )
+
+        self.client = Groq(
+            api_key=api_key,
+        )
+
+    def call(
+        self,
+        messages,
+        tools=None,
+        callbacks=None,
+        available_functions=None,
+        **kwargs,
+    ) -> Any:
+
+        # Convert a single string into a message list.
+        if isinstance(messages, str):
+            messages = [
+                {
+                    "role": "user",
+                    "content": messages,
+                }
+            ]
+
+        # Make a normal Python list.
+        clean_messages = []
+
+        for message in messages:
+
+            if isinstance(message, dict):
+
+                clean_messages.append(message)
+
+            else:
+
+                # Defensive conversion for CrewAI message objects.
+                try:
+                    clean_messages.append(
+                        {
+                            "role": message.role,
+                            "content": message.content,
+                        }
+                    )
+                except Exception:
+
+                    clean_messages.append(
+                        {
+                            "role": "user",
+                            "content": str(message),
+                        }
+                    )
+
+        request_kwargs = {
+            "model": self.model,
+            "messages": clean_messages,
+            "temperature": self.temperature,
+        }
+
+        # CrewAI converts its tools into OpenAI-compatible schemas.
+        if tools:
+
+            request_kwargs["tools"] = tools
+            request_kwargs["tool_choice"] = "auto"
+
+        # Send request directly to Groq.
+        response = self.client.chat.completions.create(
+            **request_kwargs
+        )
+
+        message = response.choices[0].message
+
+        # ----------------------------------------------------
+        # TOOL CALL
+        # ----------------------------------------------------
+
+        if getattr(message, "tool_calls", None):
+
+            return message.tool_calls
+
+        # ----------------------------------------------------
+        # NORMAL RESPONSE
+        # ----------------------------------------------------
+
+        return message.content or ""
+
+    def supports_function_calling(self) -> bool:
+        """
+        GPT-OSS 120B supports tool/function calling on Groq.
+        """
+        return True
+
+    def supports_stop_words(self) -> bool:
+        """
+        We don't explicitly send CrewAI stop words to Groq.
+        """
+        return False
+
+    def get_context_window_size(self) -> int:
+        """
+        Groq lists GPT-OSS 120B with a 131,072-token context window.
+        """
+        return 131072
+
+
+# ============================================================
+# CREATE LLM
 # ============================================================
 
 def create_llm():
 
-    groq_api_key = get_secret("GROQ_API_KEY")
-
-    if not groq_api_key:
-
-        raise ValueError(
-            "GROQ_API_KEY is missing. "
-            "Add it to Streamlit Secrets."
-        )
-
-    return LLM(
-        model="openai/gpt-oss-120b",
-
-        custom_openai=True,
-
-        base_url="https://api.groq.com/openai/v1",
-
-        api_key=groq_api_key,
-
+    return GroqCrewLLM(
+        model=MODEL_NAME,
         temperature=0.2,
     )
 
@@ -53,15 +193,6 @@ def run_research(
     research_question: str,
     status_callback=None,
 ):
-    """
-    Runs:
-
-    1. Research Manager
-    2. Web Research
-    3. Academic Research
-    4. Industry Research
-    5. Synthesizer
-    """
 
     if not research_question.strip():
 
@@ -71,9 +202,9 @@ def run_research(
 
     llm = create_llm()
 
-    # --------------------------------------------------------
-    # AGENTS
-    # --------------------------------------------------------
+    # ========================================================
+    # CREATE AGENTS
+    # ========================================================
 
     manager = create_research_manager(llm)
 
@@ -85,8 +216,9 @@ def run_research(
 
     synthesizer = create_synthesizer(llm)
 
+
     # ========================================================
-    # STEP 1 — RESEARCH MANAGER
+    # STAGE 1 — RESEARCH MANAGER
     # ========================================================
 
     if status_callback:
@@ -94,49 +226,43 @@ def run_research(
         status_callback(
             "manager",
             "running",
-            "🧭 Research Manager — planning the investigation"
+            "🧭 Research Manager — planning research",
         )
 
+
     manager_task = Task(
-
         description=f"""
-You are managing a research project.
+        Develop a focused research plan for this question:
 
-Research question:
+        {research_question}
 
-{research_question}
+        The plan must identify:
 
-Create a focused research plan.
+        1. The main questions that need to be answered.
+        2. Important concepts and terminology.
+        3. What should be investigated on the public web.
+        4. What academic evidence should be investigated.
+        5. What industry and market evidence should be investigated.
+        6. Important limitations or uncertainties.
 
-The plan must contain:
-
-1. The core question to answer.
-2. Important sub-questions.
-3. What the Web Research Specialist should investigate.
-4. What the Academic Research Specialist should investigate.
-5. What the Industry and Market Research Specialist should investigate.
-6. Important source types to prioritize.
-7. Potential contradictions or evidence gaps to watch for.
-
-Do not write the final report.
-Create a practical research plan for the three specialists.
-""",
+        Keep the plan practical and focused.
+        """,
 
         expected_output="""
-A structured research plan with:
-- Core question
-- Web research directions
-- Academic research directions
-- Industry/market research directions
-- Source priorities
-- Evidence gaps
-""",
+        A concise research plan containing:
+        - Research objectives
+        - Key questions
+        - Web research focus
+        - Academic research focus
+        - Industry research focus
+        - Important limitations
+        """,
 
         agent=manager,
     )
 
-    manager_crew = Crew(
 
+    manager_crew = Crew(
         agents=[manager],
 
         tasks=[manager_task],
@@ -146,20 +272,23 @@ A structured research plan with:
         verbose=False,
     )
 
+
     manager_result = manager_crew.kickoff()
 
     research_plan = manager_result.raw
+
 
     if status_callback:
 
         status_callback(
             "manager",
             "complete",
-            "✓ Research Manager — research plan completed"
+            "✓ Research Manager — plan completed",
         )
 
+
     # ========================================================
-    # STEP 2 — THREE PARALLEL RESEARCHERS
+    # STAGE 2 — THREE PARALLEL RESEARCH AGENTS
     # ========================================================
 
     if status_callback:
@@ -167,174 +296,165 @@ A structured research plan with:
         status_callback(
             "web",
             "running",
-            "🌐 Web Research — searching current sources"
+            "🌐 Web Research — working",
         )
 
         status_callback(
             "academic",
             "running",
-            "🎓 Academic Research — searching scholarly evidence"
+            "🎓 Academic Research — working",
         )
 
         status_callback(
             "industry",
             "running",
-            "📊 Industry Research — analyzing market evidence"
+            "📊 Industry Research — working",
         )
 
+
     # --------------------------------------------------------
-    # WEB TASK
+    # WEB
     # --------------------------------------------------------
 
     web_task = Task(
-
         description=f"""
-Research the following question from the web:
+        Research the following question from current public
+        web sources:
 
-{research_question}
+        {research_question}
 
-Here is the research manager's plan:
+        Research plan:
 
-{research_plan}
+        {research_plan}
 
-Your responsibilities:
+        Use your web research tools.
 
-- Search for current information.
-- Find credible sources.
-- Prefer primary sources where possible.
-- Read important webpages.
-- Extract concrete facts.
-- Identify dates.
-- Identify important organizations, products, technologies,
-  events or developments.
-- Record URLs for important sources.
-- Avoid unsupported claims.
+        Find:
+        - Current facts
+        - Recent developments
+        - Important organizations
+        - Relevant statistics
+        - Industry announcements
+        - High-quality primary sources
 
-Produce a concise but evidence-rich research brief.
-""",
+        Whenever possible, prefer primary or authoritative sources.
+
+        Include source URLs in your findings.
+        """,
 
         expected_output="""
-A web research brief containing:
-
-- Key findings
-- Supporting evidence
-- Important dates
-- Important organizations or sources
-- Source URLs
-- Uncertainty or limitations
-""",
+        A structured web research report containing:
+        - Key findings
+        - Evidence
+        - Important dates
+        - Relevant statistics
+        - Source URLs
+        - Uncertainties
+        """,
 
         agent=web_researcher,
 
         async_execution=True,
     )
 
+
     # --------------------------------------------------------
-    # ACADEMIC TASK
+    # ACADEMIC
     # --------------------------------------------------------
 
     academic_task = Task(
-
         description=f"""
-Research the following question using academic literature:
+        Investigate the following research question using
+        academic and scholarly sources:
 
-{research_question}
+        {research_question}
 
-Here is the research manager's plan:
+        Research plan:
 
-{research_plan}
+        {research_plan}
 
-Your responsibilities:
+        Use the academic research tools.
 
-- Search scholarly literature.
-- Identify important studies.
-- Extract meaningful findings.
-- Include publication years.
-- Include authors or institutions when useful.
-- Note citation information when available.
-- Compare findings where appropriate.
-- Identify limitations of studies.
-- Include URLs or DOI information when available.
+        Focus on:
+        - Peer-reviewed research
+        - Scholarly publications
+        - Research findings
+        - Methods
+        - Evidence
+        - Publication dates
+        - Citation information where available
 
-Do not invent academic evidence.
-""",
+        Clearly distinguish established findings from
+        preliminary or limited evidence.
+
+        Include source URLs or identifiers whenever available.
+        """,
 
         expected_output="""
-An academic research brief containing:
-
-- Important studies
-- Main findings
-- Publication years
-- Authors/institutions
-- Relevant URLs or DOI information
-- Areas of agreement/disagreement
-- Research limitations
-""",
+        A structured academic research report containing:
+        - Major academic findings
+        - Evidence
+        - Relevant studies
+        - Publication information
+        - Limitations
+        - Source URLs or identifiers
+        """,
 
         agent=academic_researcher,
 
         async_execution=True,
     )
 
+
     # --------------------------------------------------------
-    # INDUSTRY TASK
+    # INDUSTRY
     # --------------------------------------------------------
 
     industry_task = Task(
-
         description=f"""
-Research the following question from an industry and market
-perspective:
+        Analyze the industry and market dimensions of:
 
-{research_question}
+        {research_question}
 
-Here is the research manager's plan:
+        Research plan:
 
-{research_plan}
+        {research_plan}
 
-Investigate:
+        Use web research tools to investigate:
 
-- Companies
-- Products
-- Market developments
-- Business models
-- Industry adoption
-- Competitive dynamics
-- Technology trends
-- Commercial implications
-- Relevant recent announcements
-- Credible market evidence
+        - Companies
+        - Products
+        - Market developments
+        - Business models
+        - Commercial adoption
+        - Competitive landscape
+        - Investment or funding signals
+        - Industry challenges
+        - Market opportunities
 
-Use web search and read important sources.
+        Clearly distinguish reported facts from estimates
+        and company claims.
 
-Record source URLs.
-
-Do not make unsupported market claims.
-""",
+        Include source URLs.
+        """,
 
         expected_output="""
-An industry and market research brief containing:
-
-- Industry findings
-- Market developments
-- Companies/products
-- Competitive information
-- Adoption or business implications
-- Supporting source URLs
-- Important uncertainties
-""",
+        A structured industry research report containing:
+        - Market findings
+        - Company examples
+        - Competitive developments
+        - Business implications
+        - Industry challenges
+        - Source URLs
+        """,
 
         agent=industry_researcher,
 
         async_execution=True,
     )
 
-    # --------------------------------------------------------
-    # PARALLEL RESEARCH CREW
-    # --------------------------------------------------------
 
     research_crew = Crew(
-
         agents=[
             web_researcher,
             academic_researcher,
@@ -352,48 +472,72 @@ An industry and market research brief containing:
         verbose=False,
     )
 
+
     research_result = research_crew.kickoff()
+
+
+    # ========================================================
+    # EXTRACT RESEARCH RESULTS
+    # ========================================================
+
+    research_outputs = []
+
+    for task_output in research_result.tasks_output:
+
+        try:
+            research_outputs.append(
+                task_output.raw
+            )
+        except Exception:
+
+            research_outputs.append(
+                str(task_output)
+            )
+
+
+    # We expect three outputs.
+    web_findings = (
+        research_outputs[0]
+        if len(research_outputs) > 0
+        else ""
+    )
+
+    academic_findings = (
+        research_outputs[1]
+        if len(research_outputs) > 1
+        else ""
+    )
+
+    industry_findings = (
+        research_outputs[2]
+        if len(research_outputs) > 2
+        else ""
+    )
+
 
     if status_callback:
 
         status_callback(
             "web",
             "complete",
-            "✓ Web Research — completed"
+            "✓ Web Research — completed",
         )
 
         status_callback(
             "academic",
             "complete",
-            "✓ Academic Research — completed"
+            "✓ Academic Research — completed",
         )
 
         status_callback(
             "industry",
             "complete",
-            "✓ Industry Research — completed"
+            "✓ Industry Research — completed",
         )
 
-    # ========================================================
-    # COLLECT RESEARCH OUTPUTS
-    # ========================================================
-
-    research_outputs = []
-
-    for output in research_result.tasks_output:
-
-        if output and output.raw:
-
-            research_outputs.append(
-                output.raw
-            )
-
-    combined_research = "\n\n".join(
-        research_outputs
-    )
 
     # ========================================================
-    # STEP 3 — SYNTHESIS
+    # STAGE 3 — SYNTHESIZER
     # ========================================================
 
     if status_callback:
@@ -401,89 +545,88 @@ An industry and market research brief containing:
         status_callback(
             "synthesizer",
             "running",
-            "✍️ Synthesizer — writing the final research report"
+            "✍️ Synthesizer — writing final report",
         )
 
+
     synthesis_task = Task(
-
         description=f"""
-Create the final research report for this question:
+        Create a high-quality final research report.
 
-{research_question}
-
-RESEARCH MANAGER PLAN
-=====================
-
-{research_plan}
+        ORIGINAL QUESTION
+        ==================
+        {research_question}
 
 
-RESEARCH FINDINGS
-=================
+        RESEARCH PLAN
+        ==================
+        {research_plan}
 
-{combined_research}
+
+        WEB RESEARCH
+        ==================
+        {web_findings}
 
 
-Your job is to synthesize these findings into one professional,
-accurate research report.
+        ACADEMIC RESEARCH
+        ==================
+        {academic_findings}
 
-IMPORTANT RULES:
 
-1. Do not invent facts.
-2. Do not invent citations.
-3. Preserve source URLs supplied by researchers.
-4. Clearly distinguish evidence from interpretation.
-5. If sources disagree, explain the disagreement.
-6. Prefer specific evidence over vague statements.
-7. Mention important limitations.
-8. Use Markdown.
-9. Make the report useful to a human decision-maker.
-10. Do not mention internal agent mechanics unless useful.
+        INDUSTRY / MARKET RESEARCH
+        ==================
+        {industry_findings}
 
-Use exactly this structure:
 
-# Research Report
+        Your job is to synthesize the evidence.
 
-## Executive Summary
+        Do not simply copy the research outputs.
 
-## Key Findings
+        Compare findings across the three perspectives.
 
-## Web Research Findings
+        Clearly distinguish:
+        - Established evidence
+        - Reported claims
+        - Estimates
+        - Conflicting evidence
+        - Important uncertainty
 
-## Academic Evidence
+        Do not invent sources, statistics, quotations,
+        companies, studies, or citations.
 
-## Industry and Market Evidence
+        Preserve useful source URLs from the research.
 
-## Cross-Source Analysis
-
-## Important Limitations
-
-## Conclusion
-
-## Sources
-
-Under Sources, provide a clean bullet list of the important
-URLs found by the researchers.
-""",
+        Produce a polished report suitable for a researcher,
+        student, analyst, or business professional.
+        """,
 
         expected_output="""
-A polished Markdown research report containing:
+        A complete Markdown research report with these sections:
 
-- Executive Summary
-- Key Findings
-- Web Research Findings
-- Academic Evidence
-- Industry and Market Evidence
-- Cross-Source Analysis
-- Important Limitations
-- Conclusion
-- Sources
-""",
+        # Executive Summary
+
+        # Key Findings
+
+        # Web Research Findings
+
+        # Academic Evidence
+
+        # Industry / Market Evidence
+
+        # Cross-Source Analysis
+
+        # Limitations and Uncertainties
+
+        # Conclusion
+
+        # Sources
+        """,
 
         agent=synthesizer,
     )
 
-    synthesis_crew = Crew(
 
+    synthesis_crew = Crew(
         agents=[synthesizer],
 
         tasks=[synthesis_task],
@@ -493,20 +636,29 @@ A polished Markdown research report containing:
         verbose=False,
     )
 
-    final_result = synthesis_crew.kickoff()
 
-    final_report = final_result.raw
+    synthesis_result = synthesis_crew.kickoff()
+
+    final_report = synthesis_result.raw
+
 
     if status_callback:
 
         status_callback(
             "synthesizer",
             "complete",
-            "✓ Synthesizer — final report completed"
+            "✓ Synthesizer — report completed",
         )
 
+
+    # ========================================================
+    # RETURN
+    # ========================================================
+
     return {
-        "research_plan": research_plan,
-        "research": combined_research,
         "report": final_report,
+        "research_plan": research_plan,
+        "web_research": web_findings,
+        "academic_research": academic_findings,
+        "industry_research": industry_findings,
     }
