@@ -1,7 +1,8 @@
 # crew.py
 
 import os
-from typing import Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import streamlit as st
 from groq import Groq
@@ -29,7 +30,7 @@ MODEL_NAME = "openai/gpt-oss-120b"
 def get_secret(name: str) -> str:
     """
     Read a secret from environment variables first,
-    then fall back to Streamlit secrets.
+    then Streamlit secrets.
     """
 
     value = os.getenv(name)
@@ -50,23 +51,17 @@ def get_secret(name: str) -> str:
 
 
 # ============================================================
-# CUSTOM GROQ LLM FOR CREWAI
+# CUSTOM GROQ LLM
 # ============================================================
 
 class GroqCrewLLM(BaseLLM):
     """
-    Custom CrewAI LLM implementation using the official
-    Groq Python SDK directly.
+    Custom CrewAI LLM using the official Groq Python SDK.
 
-    This avoids CrewAI's OpenAI-compatible provider changing:
+    This is used instead of CrewAI's OpenAI-compatible
+    provider because Groq requires the exact model ID:
 
         openai/gpt-oss-120b
-
-    into:
-
-        gpt-oss-120b
-
-    which Groq does not accept.
     """
 
     def __init__(
@@ -92,22 +87,10 @@ class GroqCrewLLM(BaseLLM):
         )
 
     # --------------------------------------------------------
-    # CLEAN CREWAI MESSAGE
+    # CLEAN VALUES
     # --------------------------------------------------------
 
     def _clean_value(self, value):
-        """
-        Recursively clean objects before sending them to Groq.
-
-        In particular, CrewAI may add:
-
-            cache_breakpoint
-
-        to messages.
-
-        Groq Chat Completions does not accept that field, so
-        remove it before making the API request.
-        """
 
         if isinstance(value, dict):
 
@@ -115,8 +98,8 @@ class GroqCrewLLM(BaseLLM):
 
             for key, item in value.items():
 
-                # CrewAI/OpenAI-compatible metadata that Groq
-                # Chat Completions does not accept.
+                # CrewAI can add this field.
+                # Groq Chat Completions does not accept it.
                 if key == "cache_breakpoint":
                     continue
 
@@ -141,7 +124,7 @@ class GroqCrewLLM(BaseLLM):
         return value
 
     # --------------------------------------------------------
-    # CONVERT MESSAGE OBJECTS
+    # CLEAN MESSAGES
     # --------------------------------------------------------
 
     def _clean_messages(self, messages):
@@ -159,7 +142,6 @@ class GroqCrewLLM(BaseLLM):
 
         for message in messages:
 
-            # Already a dictionary
             if isinstance(message, dict):
 
                 cleaned_message = self._clean_value(
@@ -172,7 +154,6 @@ class GroqCrewLLM(BaseLLM):
 
                 continue
 
-            # CrewAI/OpenAI-style message object
             try:
 
                 cleaned_message = {
@@ -190,7 +171,6 @@ class GroqCrewLLM(BaseLLM):
                     ),
                 }
 
-                # Preserve tool calls when present.
                 tool_calls = getattr(
                     message,
                     "tool_calls",
@@ -205,7 +185,6 @@ class GroqCrewLLM(BaseLLM):
                         tool_calls
                     )
 
-                # Preserve tool-call related fields.
                 name = getattr(
                     message,
                     "name",
@@ -246,7 +225,7 @@ class GroqCrewLLM(BaseLLM):
         return clean_messages
 
     # --------------------------------------------------------
-    # CREWAI LLM CALL
+    # LLM CALL
     # --------------------------------------------------------
 
     def call(
@@ -262,20 +241,13 @@ class GroqCrewLLM(BaseLLM):
             messages
         )
 
-        # ----------------------------------------------------
-        # GROQ REQUEST
-        # ----------------------------------------------------
-
         request_kwargs = {
             "model": self.model,
             "messages": clean_messages,
             "temperature": self.temperature,
         }
 
-        # ----------------------------------------------------
-        # TOOL CALLING
-        # ----------------------------------------------------
-
+        # Tool/function calling
         if tools:
 
             request_kwargs["tools"] = (
@@ -283,10 +255,6 @@ class GroqCrewLLM(BaseLLM):
             )
 
             request_kwargs["tool_choice"] = "auto"
-
-        # ----------------------------------------------------
-        # CALL GROQ
-        # ----------------------------------------------------
 
         response = (
             self.client
@@ -303,10 +271,7 @@ class GroqCrewLLM(BaseLLM):
             .message
         )
 
-        # ----------------------------------------------------
-        # TOOL CALL RESPONSE
-        # ----------------------------------------------------
-
+        # Return native tool calls to CrewAI.
         tool_calls = getattr(
             message,
             "tool_calls",
@@ -316,10 +281,6 @@ class GroqCrewLLM(BaseLLM):
         if tool_calls:
 
             return tool_calls
-
-        # ----------------------------------------------------
-        # NORMAL TEXT RESPONSE
-        # ----------------------------------------------------
 
         return message.content or ""
 
@@ -350,19 +311,14 @@ def create_llm():
 
 
 # ============================================================
-# SAFE OUTPUT HELPER
+# OUTPUT HELPER
 # ============================================================
 
 def get_output_text(result) -> str:
-    """
-    Convert CrewAI CrewOutput / TaskOutput / normal values
-    into plain text.
-    """
 
     if result is None:
         return ""
 
-    # CrewOutput.raw
     raw = getattr(
         result,
         "raw",
@@ -372,7 +328,6 @@ def get_output_text(result) -> str:
     if raw is not None:
         return str(raw)
 
-    # TaskOutput.raw
     output = getattr(
         result,
         "output",
@@ -386,7 +341,7 @@ def get_output_text(result) -> str:
 
 
 # ============================================================
-# STATUS CALLBACK HELPER
+# STATUS HELPER
 # ============================================================
 
 def update_status(
@@ -394,194 +349,48 @@ def update_status(
     key: str,
     message: str,
 ):
-    """
-    Safely update Streamlit UI status if a callback
-    was provided by app.py.
-    """
 
     if status_callback is None:
         return
 
     try:
+
         status_callback(
             key,
             message,
         )
+
     except Exception:
-        # UI callbacks should never crash research execution.
+        # Never let UI updates break the research pipeline.
         pass
 
 
 # ============================================================
-# MAIN RESEARCH FUNCTION
+# WEB RESEARCH WORKER
 # ============================================================
 
-def run_research(
+def run_web_research(
     research_question: str,
+    research_plan: str,
     status_callback=None,
 ):
-    """
-    Run the complete multi-agent research pipeline.
 
-    Pipeline:
+    try:
 
-        Research Manager
-              ↓
-        ┌─────┼─────────────┐
-        ↓     ↓             ↓
-       Web  Academic    Industry
-        └─────┼─────────────┘
-              ↓
-          Synthesizer
-              ↓
-          Final Report
-    """
-
-    if not research_question:
-        raise ValueError(
-            "Please provide a research question."
+        update_status(
+            status_callback,
+            "web",
+            "Web researcher is working...",
         )
 
-    research_question = research_question.strip()
+        llm = create_llm()
 
-    if not research_question:
-        raise ValueError(
-            "Please provide a research question."
+        web_researcher = create_web_researcher(
+            llm=llm
         )
 
-    # ========================================================
-    # CREATE LLM
-    # ========================================================
-
-    llm = create_llm()
-
-    # ========================================================
-    # CREATE AGENTS
-    # ========================================================
-
-    manager = create_research_manager(
-        llm=llm
-    )
-
-    web_researcher = create_web_researcher(
-        llm=llm
-    )
-
-    academic_researcher = create_academic_researcher(
-        llm=llm
-    )
-
-    industry_researcher = create_industry_researcher(
-        llm=llm
-    )
-
-    synthesizer = create_synthesizer(
-        llm=llm
-    )
-
-    # ========================================================
-    # 1. RESEARCH MANAGER
-    # ========================================================
-
-    update_status(
-        status_callback,
-        "manager",
-        "Creating research strategy...",
-    )
-
-    manager_task = Task(
-        description=f"""
-You are managing a multi-agent research project.
-
-Research question:
-
-{research_question}
-
-Your job is to create a clear research plan for the
-specialist researchers.
-
-Create a plan containing:
-
-1. The main research objective.
-2. Key questions that must be answered.
-3. Important concepts or terminology to investigate.
-4. What evidence should be collected.
-5. What should be investigated by:
-   - Web Researcher
-   - Academic Researcher
-   - Industry / Market Researcher
-6. Important risks, assumptions, or limitations.
-
-Do NOT write the final research report.
-
-Your output should be a concise but detailed research plan
-that the three specialist researchers can directly follow.
-""",
-        expected_output="""
-A structured research plan with:
-
-- research objective
-- key questions
-- evidence requirements
-- web research instructions
-- academic research instructions
-- industry research instructions
-- limitations and considerations
-""",
-        agent=manager,
-    )
-
-    manager_crew = Crew(
-        agents=[
-            manager
-        ],
-        tasks=[
-            manager_task
-        ],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-    manager_result = manager_crew.kickoff()
-
-    research_plan = get_output_text(
-        manager_result
-    )
-
-    update_status(
-        status_callback,
-        "manager",
-        "Research strategy completed.",
-    )
-
-    # ========================================================
-    # 2. SPECIALIST RESEARCH
-    # ========================================================
-
-    update_status(
-        status_callback,
-        "web",
-        "Web researcher started...",
-    )
-
-    update_status(
-        status_callback,
-        "academic",
-        "Academic researcher started...",
-    )
-
-    update_status(
-        status_callback,
-        "industry",
-        "Industry researcher started...",
-    )
-
-    # ========================================================
-    # WEB RESEARCH TASK
-    # ========================================================
-
-    web_task = Task(
-        description=f"""
+        web_task = Task(
+            description=f"""
 Conduct web research for the following research project.
 
 RESEARCH QUESTION:
@@ -625,7 +434,7 @@ Do not invent sources or statistics.
 Return structured research findings that another agent
 can use to write the final report.
 """,
-        expected_output="""
+            expected_output="""
 Detailed web research findings including:
 
 - key findings
@@ -636,16 +445,71 @@ Detailed web research findings including:
 - important recent developments
 - limitations or conflicting evidence
 """,
-        agent=web_researcher,
-        async_execution=True,
-    )
+            agent=web_researcher,
+        )
 
-    # ========================================================
-    # ACADEMIC RESEARCH TASK
-    # ========================================================
+        web_crew = Crew(
+            agents=[
+                web_researcher
+            ],
+            tasks=[
+                web_task
+            ],
+            process=Process.sequential,
+            verbose=False,
+        )
 
-    academic_task = Task(
-        description=f"""
+        result = web_crew.kickoff()
+
+        findings = get_output_text(
+            result
+        )
+
+        update_status(
+            status_callback,
+            "web",
+            "Web research completed.",
+        )
+
+        return findings
+
+    except Exception as exc:
+
+        update_status(
+            status_callback,
+            "web",
+            f"Web research failed: {exc}",
+        )
+
+        raise
+
+
+# ============================================================
+# ACADEMIC RESEARCH WORKER
+# ============================================================
+
+def run_academic_research(
+    research_question: str,
+    research_plan: str,
+    status_callback=None,
+):
+
+    try:
+
+        update_status(
+            status_callback,
+            "academic",
+            "Academic researcher is working...",
+        )
+
+        llm = create_llm()
+
+        academic_researcher = create_academic_researcher(
+            llm=llm
+        )
+
+        academic_task = Task(
+            description=f"""
 Conduct academic research for the following project.
 
 RESEARCH QUESTION:
@@ -689,7 +553,7 @@ Clearly identify where evidence is limited or mixed.
 Return structured academic findings that another agent
 can use in the final report.
 """,
-        expected_output="""
+            expected_output="""
 Detailed academic research findings including:
 
 - important studies
@@ -702,16 +566,71 @@ Detailed academic research findings including:
 - limitations
 - areas of disagreement
 """,
-        agent=academic_researcher,
-        async_execution=True,
-    )
+            agent=academic_researcher,
+        )
 
-    # ========================================================
-    # INDUSTRY RESEARCH TASK
-    # ========================================================
+        academic_crew = Crew(
+            agents=[
+                academic_researcher
+            ],
+            tasks=[
+                academic_task
+            ],
+            process=Process.sequential,
+            verbose=False,
+        )
 
-    industry_task = Task(
-        description=f"""
+        result = academic_crew.kickoff()
+
+        findings = get_output_text(
+            result
+        )
+
+        update_status(
+            status_callback,
+            "academic",
+            "Academic research completed.",
+        )
+
+        return findings
+
+    except Exception as exc:
+
+        update_status(
+            status_callback,
+            "academic",
+            f"Academic research failed: {exc}",
+        )
+
+        raise
+
+
+# ============================================================
+# INDUSTRY RESEARCH WORKER
+# ============================================================
+
+def run_industry_research(
+    research_question: str,
+    research_plan: str,
+    status_callback=None,
+):
+
+    try:
+
+        update_status(
+            status_callback,
+            "industry",
+            "Industry researcher is working...",
+        )
+
+        llm = create_llm()
+
+        industry_researcher = create_industry_researcher(
+            llm=llm
+        )
+
+        industry_task = Task(
+            description=f"""
 Conduct industry and market research for the following
 research project.
 
@@ -759,7 +678,7 @@ verified evidence.
 Return structured industry findings that another agent
 can use in the final report.
 """,
-        expected_output="""
+            expected_output="""
 Detailed industry and market research including:
 
 - market trends
@@ -773,111 +692,74 @@ Detailed industry and market research including:
 - risks
 - source URLs
 """,
-        agent=industry_researcher,
-        async_execution=True,
-    )
-
-    # ========================================================
-    # RUN THREE SPECIALISTS
-    #
-    # CrewAI async tasks execute concurrently within this
-    # specialist crew.
-    # ========================================================
-
-    specialist_crew = Crew(
-        agents=[
-            web_researcher,
-            academic_researcher,
-            industry_researcher,
-        ],
-        tasks=[
-            web_task,
-            academic_task,
-            industry_task,
-        ],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-    specialist_result = specialist_crew.kickoff()
-
-    # ========================================================
-    # GET INDIVIDUAL RESULTS
-    # ========================================================
-
-    web_findings = get_output_text(
-        getattr(
-            web_task,
-            "output",
-            None,
-        )
-    )
-
-    academic_findings = get_output_text(
-        getattr(
-            academic_task,
-            "output",
-            None,
-        )
-    )
-
-    industry_findings = get_output_text(
-        getattr(
-            industry_task,
-            "output",
-            None,
-        )
-    )
-
-    # Fallback if CrewAI did not attach task outputs
-    # individually for some reason.
-    if not web_findings:
-        web_findings = get_output_text(
-            specialist_result
+            agent=industry_researcher,
         )
 
-    if not academic_findings:
-        academic_findings = (
-            "Academic research output was not "
-            "returned separately."
+        industry_crew = Crew(
+            agents=[
+                industry_researcher
+            ],
+            tasks=[
+                industry_task
+            ],
+            process=Process.sequential,
+            verbose=False,
         )
 
-    if not industry_findings:
-        industry_findings = (
-            "Industry research output was not "
-            "returned separately."
+        result = industry_crew.kickoff()
+
+        findings = get_output_text(
+            result
         )
 
-    update_status(
-        status_callback,
-        "web",
-        "Web research completed.",
-    )
+        update_status(
+            status_callback,
+            "industry",
+            "Industry research completed.",
+        )
 
-    update_status(
-        status_callback,
-        "academic",
-        "Academic research completed.",
-    )
+        return findings
 
-    update_status(
-        status_callback,
-        "industry",
-        "Industry research completed.",
-    )
+    except Exception as exc:
 
-    # ========================================================
-    # 3. SYNTHESIZER
-    # ========================================================
+        update_status(
+            status_callback,
+            "industry",
+            f"Industry research failed: {exc}",
+        )
 
-    update_status(
-        status_callback,
-        "synthesizer",
-        "Synthesizing final report...",
-    )
+        raise
 
-    synthesis_task = Task(
-        description=f"""
+
+# ============================================================
+# SYNTHESIS
+# ============================================================
+
+def run_synthesis(
+    research_question: str,
+    research_plan: str,
+    web_findings: str,
+    academic_findings: str,
+    industry_findings: str,
+    status_callback=None,
+):
+
+    try:
+
+        update_status(
+            status_callback,
+            "synthesizer",
+            "Synthesizer is creating the final report...",
+        )
+
+        llm = create_llm()
+
+        synthesizer = create_synthesizer(
+            llm=llm
+        )
+
+        synthesis_task = Task(
+            description=f"""
 You are the lead research synthesizer.
 
 Write a high-quality final research report based ONLY
@@ -914,12 +796,10 @@ INDUSTRY / MARKET RESEARCH
 {industry_findings}
 
 ========================================================
-REPORT REQUIREMENTS
+REPORT STRUCTURE
 ========================================================
 
-Create a professional research report.
-
-Use this structure:
+Create a professional research report using:
 
 # Executive Summary
 
@@ -993,17 +873,17 @@ IMPORTANT RULES
 
 7. Use information from all three research streams.
 
-8. Do not mention internal agent names or the multi-agent
-   implementation in the final report.
+8. Do not mention internal agent names in the final report.
 
-9. Do not say that you browsed the internet unless that
-   is relevant to explaining the sources.
+9. Do not fabricate academic papers.
 
-10. Make the report readable and professional.
+10. Do not fabricate statistics.
+
+11. Make the report readable and professional.
 
 Return ONLY the final research report.
 """,
-        expected_output="""
+            expected_output="""
 A complete professional research report containing:
 
 - Executive Summary
@@ -1018,40 +898,256 @@ A complete professional research report containing:
 - Conclusion
 - Sources
 """,
-        agent=synthesizer,
+            agent=synthesizer,
+        )
+
+        synthesis_crew = Crew(
+            agents=[
+                synthesizer
+            ],
+            tasks=[
+                synthesis_task
+            ],
+            process=Process.sequential,
+            verbose=False,
+        )
+
+        result = synthesis_crew.kickoff()
+
+        final_report = get_output_text(
+            result
+        )
+
+        update_status(
+            status_callback,
+            "synthesizer",
+            "Final report completed.",
+        )
+
+        return final_report
+
+    except Exception as exc:
+
+        update_status(
+            status_callback,
+            "synthesizer",
+            f"Synthesis failed: {exc}",
+        )
+
+        raise
+
+
+# ============================================================
+# MAIN RESEARCH PIPELINE
+# ============================================================
+
+def run_research(
+    research_question: str,
+    status_callback=None,
+):
+    """
+    Complete research pipeline.
+
+    1. Research Manager
+    2. Web Research       ┐
+    3. Academic Research  ├── run concurrently
+    4. Industry Research  ┘
+    5. Synthesizer
+    """
+
+    # ========================================================
+    # VALIDATE QUESTION
+    # ========================================================
+
+    if not research_question:
+
+        raise ValueError(
+            "Please provide a research question."
+        )
+
+    research_question = (
+        research_question.strip()
     )
 
-    synthesis_crew = Crew(
+    if not research_question:
+
+        raise ValueError(
+            "Please provide a research question."
+        )
+
+    # ========================================================
+    # MANAGER
+    # ========================================================
+
+    update_status(
+        status_callback,
+        "manager",
+        "Research Manager is creating the research plan...",
+    )
+
+    llm = create_llm()
+
+    manager = create_research_manager(
+        llm=llm
+    )
+
+    manager_task = Task(
+        description=f"""
+You are managing a multi-agent research project.
+
+RESEARCH QUESTION:
+
+{research_question}
+
+Create a clear research plan for the specialist
+researchers.
+
+The plan must contain:
+
+1. Main research objective.
+2. Key questions that must be answered.
+3. Important concepts and terminology.
+4. Evidence that should be collected.
+5. What should be investigated by:
+   - Web Researcher
+   - Academic Researcher
+   - Industry / Market Researcher
+6. Important risks, assumptions, and limitations.
+
+Do NOT write the final report.
+
+Create a concise but detailed research plan that the
+specialist researchers can directly follow.
+""",
+        expected_output="""
+A structured research plan containing:
+
+- research objective
+- key questions
+- evidence requirements
+- web research instructions
+- academic research instructions
+- industry research instructions
+- limitations and considerations
+""",
+        agent=manager,
+    )
+
+    manager_crew = Crew(
         agents=[
-            synthesizer
+            manager
         ],
         tasks=[
-            synthesis_task
+            manager_task
         ],
         process=Process.sequential,
         verbose=False,
     )
 
-    synthesis_result = synthesis_crew.kickoff()
+    manager_result = manager_crew.kickoff()
 
-    final_report = get_output_text(
-        synthesis_result
+    research_plan = get_output_text(
+        manager_result
     )
 
     update_status(
         status_callback,
-        "synthesizer",
-        "Final report completed.",
+        "manager",
+        "Research strategy completed.",
     )
 
     # ========================================================
-    # RETURN COMPLETE RESULT
+    # RUN SPECIALISTS IN PARALLEL
+    # ========================================================
+
+    specialist_results = {}
+
+    with ThreadPoolExecutor(
+        max_workers=3
+    ) as executor:
+
+        futures = {
+
+            executor.submit(
+                run_web_research,
+                research_question,
+                research_plan,
+                status_callback,
+            ): "web",
+
+            executor.submit(
+                run_academic_research,
+                research_question,
+                research_plan,
+                status_callback,
+            ): "academic",
+
+            executor.submit(
+                run_industry_research,
+                research_question,
+                research_plan,
+                status_callback,
+            ): "industry",
+        }
+
+        for future in as_completed(
+            futures
+        ):
+
+            research_type = futures[
+                future
+            ]
+
+            # This will raise the original exception
+            # if a specialist failed.
+            specialist_results[
+                research_type
+            ] = future.result()
+
+    # ========================================================
+    # GET RESULTS
+    # ========================================================
+
+    web_findings = specialist_results.get(
+        "web",
+        "",
+    )
+
+    academic_findings = specialist_results.get(
+        "academic",
+        "",
+    )
+
+    industry_findings = specialist_results.get(
+        "industry",
+        "",
+    )
+
+    # ========================================================
+    # SYNTHESIZER
+    # ========================================================
+
+    final_report = run_synthesis(
+        research_question=research_question,
+        research_plan=research_plan,
+        web_findings=web_findings,
+        academic_findings=academic_findings,
+        industry_findings=industry_findings,
+        status_callback=status_callback,
+    )
+
+    # ========================================================
+    # RETURN RESULT
     # ========================================================
 
     return {
         "report": final_report,
+
         "research_plan": research_plan,
+
         "web_research": web_findings,
+
         "academic_research": academic_findings,
+
         "industry_research": industry_findings,
     }
