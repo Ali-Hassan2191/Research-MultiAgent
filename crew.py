@@ -1,6 +1,7 @@
 # crew.py
 
 import os
+import re
 import time
 from typing import Any
 
@@ -22,11 +23,23 @@ from synthesizer import create_synthesizer
 
 MODEL_NAME = "openai/gpt-oss-120b"
 
-# Keep prompts/output relatively small for the 8K TPM limit.
 TEMPERATURE = 0.2
 
-# Number of retries for temporary Groq rate limits.
-MAX_RETRIES = 4
+# Keep retries low.
+# A failed request should NOT create many extra API calls.
+MAX_RETRIES = 2
+
+# Maximum generated tokens per LLM request.
+MAX_OUTPUT_TOKENS = 1200
+
+# Keep context small for the 8K TPM limit.
+MAX_RESEARCH_PLAN_CHARS = 3000
+MAX_WEB_FINDINGS_CHARS = 5000
+MAX_ACADEMIC_FINDINGS_CHARS = 5000
+MAX_INDUSTRY_FINDINGS_CHARS = 5000
+
+# Small pause between agents.
+BETWEEN_AGENT_DELAY = 5
 
 
 # ============================================================
@@ -38,7 +51,7 @@ def get_secret(name: str) -> str:
     value = os.getenv(name)
 
     if value:
-        return value
+        return str(value)
 
     try:
         value = st.secrets[name]
@@ -53,7 +66,30 @@ def get_secret(name: str) -> str:
 
 
 # ============================================================
-# CUSTOM GROQ LLM
+# TEXT LIMIT HELPER
+# ============================================================
+
+def limit_text(
+    text: Any,
+    max_chars: int,
+) -> str:
+
+    if text is None:
+        return ""
+
+    text = str(text).strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    return (
+        text[:max_chars]
+        + "\n\n[Content truncated to control token usage.]"
+    )
+
+
+# ============================================================
+# GROQ LLM
 # ============================================================
 
 class GroqCrewLLM(BaseLLM):
@@ -94,7 +130,7 @@ class GroqCrewLLM(BaseLLM):
             for key, item in value.items():
 
                 # CrewAI may add this field.
-                # Groq Chat Completions does not accept it.
+                # Groq does not accept it.
                 if key == "cache_breakpoint":
                     continue
 
@@ -151,18 +187,22 @@ class GroqCrewLLM(BaseLLM):
 
             try:
 
+                role = getattr(
+                    message,
+                    "role",
+                    "user",
+                )
+
+                content = getattr(
+                    message,
+                    "content",
+                    "",
+                )
+
                 cleaned_message = {
-                    "role": getattr(
-                        message,
-                        "role",
-                        "user",
-                    ),
+                    "role": role,
                     "content": self._clean_value(
-                        getattr(
-                            message,
-                            "content",
-                            "",
-                        )
+                        content
                     ),
                 }
 
@@ -174,10 +214,8 @@ class GroqCrewLLM(BaseLLM):
 
                 if tool_calls:
 
-                    cleaned_message[
-                        "tool_calls"
-                    ] = self._clean_value(
-                        tool_calls
+                    cleaned_message["tool_calls"] = (
+                        self._clean_value(tool_calls)
                     )
 
                 name = getattr(
@@ -187,10 +225,7 @@ class GroqCrewLLM(BaseLLM):
                 )
 
                 if name:
-
-                    cleaned_message[
-                        "name"
-                    ] = name
+                    cleaned_message["name"] = name
 
                 tool_call_id = getattr(
                     message,
@@ -199,7 +234,6 @@ class GroqCrewLLM(BaseLLM):
                 )
 
                 if tool_call_id:
-
                     cleaned_message[
                         "tool_call_id"
                     ] = tool_call_id
@@ -220,7 +254,60 @@ class GroqCrewLLM(BaseLLM):
         return clean_messages
 
     # ========================================================
-    # GROQ CALL WITH RETRY
+    # EXTRACT RETRY WAIT
+    # ========================================================
+
+    def _get_retry_wait(self, error_text: str, attempt: int) -> int:
+
+        # Try to extract:
+        #
+        # "try again in 19.6s"
+        #
+        # from Groq's error message.
+
+        patterns = [
+            r"try again in\s+([\d.]+)s",
+            r"retry.*?([\d.]+)s",
+            r"after\s+([\d.]+)s",
+        ]
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                error_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+
+                try:
+
+                    seconds = float(
+                        match.group(1)
+                    )
+
+                    # Add a small safety buffer.
+                    return max(
+                        5,
+                        min(
+                            int(seconds) + 2,
+                            60,
+                        ),
+                    )
+
+                except Exception:
+                    pass
+
+        # Fallback:
+        # 8s -> 16s
+        return min(
+            8 * (2 ** attempt),
+            30,
+        )
+
+    # ========================================================
+    # GROQ CALL
     # ========================================================
 
     def call(
@@ -240,7 +327,14 @@ class GroqCrewLLM(BaseLLM):
             "model": self.model,
             "messages": clean_messages,
             "temperature": self.temperature,
+
+            # Important for controlling output token usage.
+            "max_tokens": MAX_OUTPUT_TOKENS,
         }
+
+        # ----------------------------------------------------
+        # TOOL CALLING
+        # ----------------------------------------------------
 
         if tools:
 
@@ -251,7 +345,7 @@ class GroqCrewLLM(BaseLLM):
             request_kwargs["tool_choice"] = "auto"
 
         # ----------------------------------------------------
-        # RETRY RATE LIMIT ERRORS
+        # RETRIES
         # ----------------------------------------------------
 
         for attempt in range(MAX_RETRIES):
@@ -273,6 +367,9 @@ class GroqCrewLLM(BaseLLM):
                     .message
                 )
 
+                # CrewAI needs native tool calls
+                # when the agent requests a tool.
+
                 tool_calls = getattr(
                     message,
                     "tool_calls",
@@ -283,7 +380,10 @@ class GroqCrewLLM(BaseLLM):
 
                     return tool_calls
 
-                return message.content or ""
+                return (
+                    message.content
+                    or ""
+                )
 
             except Exception as exc:
 
@@ -293,18 +393,25 @@ class GroqCrewLLM(BaseLLM):
                     "429" in error_text
                     or "rate_limit_exceeded" in error_text
                     or "Rate limit" in error_text
+                    or "rate limit" in error_text
                 )
 
                 if not is_rate_limit:
+
                     raise
 
+                # Do not keep retrying indefinitely.
                 if attempt >= MAX_RETRIES - 1:
-                    raise
 
-                # Increasing wait time:
-                # 5s → 10s → 20s → 40s
-                wait_time = 5 * (
-                    2 ** attempt
+                    raise RuntimeError(
+                        "Groq rate limit was reached "
+                        "after the maximum number of retries. "
+                        f"Original error: {error_text}"
+                    ) from exc
+
+                wait_time = self._get_retry_wait(
+                    error_text,
+                    attempt,
                 )
 
                 time.sleep(
@@ -312,7 +419,7 @@ class GroqCrewLLM(BaseLLM):
                 )
 
         raise RuntimeError(
-            "Groq request failed after retries."
+            "Groq request failed."
         )
 
     # ========================================================
@@ -418,25 +525,25 @@ def run_manager(
 
     task = Task(
         description=f"""
-Create a short research plan for:
+Create a SHORT research plan for:
 
 {research_question}
 
-Identify:
+Include:
 
 1. Main objective
-2. 3 to 5 key questions
+2. 3 key research questions
 3. Web evidence needed
 4. Academic evidence needed
 5. Industry evidence needed
-6. Important limitations
+6. Main limitations
 
-Keep the plan concise.
+Keep it under 500 words.
 
 Do not write the final report.
 """,
         expected_output="""
-A concise research plan with the objective,
+A short research plan with objective,
 key questions, evidence requirements,
 and limitations.
 """,
@@ -452,8 +559,9 @@ and limitations.
 
     result = crew.kickoff()
 
-    plan = get_output_text(
-        result
+    plan = limit_text(
+        get_output_text(result),
+        MAX_RESEARCH_PLAN_CHARS,
     )
 
     update_status(
@@ -487,6 +595,11 @@ def run_web_research(
         llm=llm
     )
 
+    research_plan = limit_text(
+        research_plan,
+        MAX_RESEARCH_PLAN_CHARS,
+    )
+
     task = Task(
         description=f"""
 Research this question:
@@ -499,23 +612,23 @@ Research plan:
 
 Use web search and webpage-reading tools.
 
-Find the most important current evidence.
+Find only the most important current evidence.
 
 Return:
 
-- 4 to 6 key findings
+- 3 to 4 key findings
 - supporting facts
 - source names
 - source URLs
 - important statistics if available
 
-Be concise.
+Keep the answer concise.
 
 Do not invent facts or sources.
 """,
         expected_output="""
-4 to 6 concise web research findings
-with supporting sources and URLs.
+3 to 4 concise web findings with
+supporting sources and URLs.
 """,
         agent=agent,
     )
@@ -529,8 +642,9 @@ with supporting sources and URLs.
 
     result = crew.kickoff()
 
-    findings = get_output_text(
-        result
+    findings = limit_text(
+        get_output_text(result),
+        MAX_WEB_FINDINGS_CHARS,
     )
 
     update_status(
@@ -564,6 +678,11 @@ def run_academic_research(
         llm=llm
     )
 
+    research_plan = limit_text(
+        research_plan,
+        MAX_RESEARCH_PLAN_CHARS,
+    )
+
     task = Task(
         description=f"""
 Research this question:
@@ -580,21 +699,21 @@ Find the most relevant scholarly evidence.
 
 Return:
 
-- 3 to 5 important papers
+- 3 important papers
 - title
 - authors when available
 - year
 - key finding
 - DOI or URL when available
-- limitations
+- important limitation
 
-Be concise.
+Keep the answer concise.
 
 Do not invent papers or citations.
 """,
         expected_output="""
-3 to 5 concise academic findings
-with paper information and source links.
+3 concise academic findings with
+paper information and source links.
 """,
         agent=agent,
     )
@@ -608,8 +727,9 @@ with paper information and source links.
 
     result = crew.kickoff()
 
-    findings = get_output_text(
-        result
+    findings = limit_text(
+        get_output_text(result),
+        MAX_ACADEMIC_FINDINGS_CHARS,
     )
 
     update_status(
@@ -643,6 +763,11 @@ def run_industry_research(
         llm=llm
     )
 
+    research_plan = limit_text(
+        research_plan,
+        MAX_RESEARCH_PLAN_CHARS,
+    )
+
     task = Task(
         description=f"""
 Research the industry and market side of:
@@ -655,7 +780,7 @@ Research plan:
 
 Use web research tools.
 
-Focus on:
+Focus only on the most relevant:
 
 - industry trends
 - companies
@@ -668,17 +793,17 @@ Focus on:
 
 Return:
 
-- 4 to 6 key findings
+- 3 to 4 key findings
 - evidence
 - source names
 - source URLs
 
-Be concise.
+Keep the answer concise.
 
 Do not invent statistics or company claims.
 """,
         expected_output="""
-4 to 6 concise industry findings
+3 to 4 concise industry findings
 with evidence and source URLs.
 """,
         agent=agent,
@@ -693,8 +818,9 @@ with evidence and source URLs.
 
     result = crew.kickoff()
 
-    findings = get_output_text(
-        result
+    findings = limit_text(
+        get_output_text(result),
+        MAX_INDUSTRY_FINDINGS_CHARS,
     )
 
     update_status(
@@ -729,6 +855,27 @@ def run_synthesis(
 
     agent = create_synthesizer(
         llm=llm
+    )
+
+    # Strictly limit everything entering synthesis.
+    research_plan = limit_text(
+        research_plan,
+        MAX_RESEARCH_PLAN_CHARS,
+    )
+
+    web_findings = limit_text(
+        web_findings,
+        MAX_WEB_FINDINGS_CHARS,
+    )
+
+    academic_findings = limit_text(
+        academic_findings,
+        MAX_ACADEMIC_FINDINGS_CHARS,
+    )
+
+    industry_findings = limit_text(
+        industry_findings,
+        MAX_INDUSTRY_FINDINGS_CHARS,
     )
 
     task = Task(
@@ -777,8 +924,8 @@ Rules:
 - Do not invent facts.
 - Do not invent citations.
 - Preserve source URLs.
-- Clearly distinguish evidence from interpretation.
-- Mention disagreements when sources conflict.
+- Distinguish evidence from interpretation.
+- Mention conflicts between sources when present.
 - Keep the report concise.
 """,
         expected_output="""
@@ -847,12 +994,6 @@ def run_research(
 
     # ========================================================
     # 2. WEB
-    #
-    # Sequential intentionally.
-    #
-    # Your current Groq account has an 8,000 TPM limit.
-    # Running three large requests concurrently causes
-    # 429 errors.
     # ========================================================
 
     web_findings = run_web_research(
@@ -861,9 +1002,9 @@ def run_research(
         status_callback,
     )
 
-    # Small pause so the next request doesn't immediately
-    # collide with the previous TPM window.
-    time.sleep(3)
+    time.sleep(
+        BETWEEN_AGENT_DELAY
+    )
 
     # ========================================================
     # 3. ACADEMIC
@@ -875,7 +1016,9 @@ def run_research(
         status_callback,
     )
 
-    time.sleep(3)
+    time.sleep(
+        BETWEEN_AGENT_DELAY
+    )
 
     # ========================================================
     # 4. INDUSTRY
@@ -887,7 +1030,9 @@ def run_research(
         status_callback,
     )
 
-    time.sleep(3)
+    time.sleep(
+        BETWEEN_AGENT_DELAY
+    )
 
     # ========================================================
     # 5. SYNTHESIS
